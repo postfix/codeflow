@@ -260,14 +260,29 @@ async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
   }
 }
 
-async function reapStartedGroup(child: ChildProcess, groupId: number, nonce: string): Promise<void> {
-  if (ownedGroupState(groupId, nonce) === "present") try { process.kill(-groupId, "SIGKILL"); } catch {}
+const qualificationChildren = new Map<string, ChildProcess>();
+
+async function waitForChildExit(child: ChildProcess): Promise<boolean> {
+  child.ref();
   if (child.exitCode === null && child.signalCode === null) {
     await new Promise<void>((resolveExit) => {
       const timeout = setTimeout(resolveExit, 5_000);
       child.once("exit", () => { clearTimeout(timeout); resolveExit(); });
     });
   }
+  const exited = child.exitCode !== null || child.signalCode !== null;
+  if (!exited) child.unref();
+  return exited;
+}
+
+async function waitForQualificationChild(groupId: number, nonce: string): Promise<void> {
+  const child = qualificationChildren.get(nonce);
+  if (child?.pid === groupId && await waitForChildExit(child)) qualificationChildren.delete(nonce);
+}
+
+async function reapStartedGroup(child: ChildProcess, groupId: number, nonce: string): Promise<void> {
+  if (ownedGroupState(groupId, nonce) === "present") try { process.kill(-groupId, "SIGKILL"); } catch {}
+  await waitForChildExit(child);
   const service = new ProcessService();
   try { await service.assertGroupAbsent({ groupId, nonce }); } catch {}
   finally { await service.dispose(); }
@@ -288,6 +303,7 @@ async function startQualificationGroup(repository: string, workspace: string): P
     await waitForPath(marker);
     const marked = JSON.parse((await readBoundedFile(marker, 4_096)).toString("utf8")) as Record<string, unknown>;
     if (marked.pid !== child.pid || marked.nonce !== nonce) throw new Error("Qualification process identity mismatch");
+    qualificationChildren.set(nonce, child);
     child.unref();
     return { groupId: child.pid, nonce, cleanup: "pending", detail: "owned group is live" };
   } catch (error) {
@@ -348,6 +364,7 @@ async function interruptQualificationGroup(group: NonNullable<FoundationEvidence
     return { ...group, cleanup: "uncertain", detail: "owned group identity could not be revalidated; no SIGKILL sent" };
   }
   if (hardKillState === "present") try { process.kill(-group.groupId, "SIGKILL"); } catch {}
+  await waitForQualificationChild(group.groupId, group.nonce);
   const service = new ProcessService();
   try {
     await service.assertGroupAbsent({ groupId: group.groupId, nonce: group.nonce });
@@ -360,8 +377,11 @@ async function interruptQualificationGroup(group: NonNullable<FoundationEvidence
 }
 
 async function reapQualificationGroup(group: FoundationEvidence["processGroup"], preparedBootId: string): Promise<void> {
-  if (!group || currentBootId() !== preparedBootId || ownedGroupState(group.groupId, group.nonce) !== "present") return;
-  try { process.kill(-group.groupId, "SIGKILL"); } catch {}
+  if (!group || currentBootId() !== preparedBootId) return;
+  const state = ownedGroupState(group.groupId, group.nonce);
+  if (state === "unknown") return;
+  if (state === "present") try { process.kill(-group.groupId, "SIGKILL"); } catch {}
+  await waitForQualificationChild(group.groupId, group.nonce);
   const service = new ProcessService();
   try { await service.assertGroupAbsent({ groupId: group.groupId, nonce: group.nonce }); } catch {}
   finally { await service.dispose(); }
