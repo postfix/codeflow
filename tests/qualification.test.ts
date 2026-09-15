@@ -134,6 +134,35 @@ if (cli) {
       }
     }, 20_000);
 
+    test("late qualification child exit releases its retained handle", async () => {
+      const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
+      const evidence = relative(process.cwd(), join(root, "process.json"));
+      const prepared = await runFoundationPhase({ target: localTarget, phase: "prepare", scenario: "process-interrupt", evidence });
+      const groupId = prepared.processGroup!.groupId;
+      const nonce = prepared.processGroup!.nonce;
+      const kill = process.kill.bind(process);
+      const deletes = vi.spyOn(Map.prototype, "delete");
+      let delayed = false;
+      const signals = vi.spyOn(process, "kill").mockImplementation(((processId: number, signal?: NodeJS.Signals | number) => {
+        if (processId === -groupId && signal === "SIGKILL" && !delayed) {
+          delayed = true;
+          setTimeout(() => { try { kill(processId, signal); } catch {} }, 5_100);
+          return true;
+        }
+        return kill(processId, signal);
+      }) as typeof process.kill);
+      try {
+        await expect(runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }))
+          .resolves.toMatchObject({ processGroup: { cleanup: "absent" } });
+        expect(deletes.mock.calls.some(([key]) => key === nonce)).toBe(true);
+      } finally {
+        signals.mockRestore();
+        deletes.mockRestore();
+        await stopGroup(groupId);
+        await rm(root, { recursive: true, force: true });
+      }
+    }, 20_000);
+
     test("unknown ownership never permits fallback hard-kill cleanup", async () => {
       const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
       const evidence = relative(process.cwd(), join(root, "process.json"));

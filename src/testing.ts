@@ -277,7 +277,12 @@ async function waitForChildExit(child: ChildProcess): Promise<boolean> {
 
 async function waitForQualificationChild(groupId: number, nonce: string): Promise<void> {
   const child = qualificationChildren.get(nonce);
-  if (child?.pid === groupId && await waitForChildExit(child)) qualificationChildren.delete(nonce);
+  if (child?.pid !== groupId) return;
+  const release = () => {
+    if (qualificationChildren.get(nonce) === child) qualificationChildren.delete(nonce);
+  };
+  child.once("exit", release);
+  if (await waitForChildExit(child)) release();
 }
 
 async function reapStartedGroup(child: ChildProcess, groupId: number, nonce: string): Promise<void> {
