@@ -1,6 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { canonicalJson, type Json } from "../src/contracts.js";
 import { assertFoundationTarget, classifyDarwinProcessGroup, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity, runFoundationPhase, type FoundationEvidence, type FoundationOptions } from "../src/testing.js";
 import { probeProcessGroup } from "../src/process.js";
@@ -17,9 +18,47 @@ function forgeEvidence(evidence: FoundationEvidence, changes: Partial<Foundation
   };
 }
 
-function groupAlive(groupId: number): boolean {
+function groupDiagnostic(groupId: number, nonce?: string): string {
+  if (process.platform !== "darwin") return `GROUP_DIAGNOSTIC groupId=${String(groupId)} platform=${process.platform}`;
+  const result = spawnSync("/bin/ps", ["-ax", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "state=", "-o", "command="], {
+    encoding: "utf8",
+    timeout: 1_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    return `GROUP_DIAGNOSTIC groupId=${String(groupId)} unavailable status=${String(result.status)}`;
+  }
+  let unparsed = 0;
+  const members = result.stdout.split(/\r?\n/).map((row) => row.trim()).filter(Boolean).flatMap((row) => {
+    const match = /^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(row);
+    if (!match) { unparsed += 1; return []; }
+    if (Number(match[3]) !== groupId) return [];
+    const argv = match[5]!.trim().split(/\s+/);
+    const role = argv.find((token) => token === "qualification-hang" || token === "qualification-grandchild") ?? "other";
+    return [{
+      pid: match[1]!,
+      ppid: match[2]!,
+      pgid: match[3]!,
+      state: match[4]!,
+      command: `${basename(argv[0] ?? "unknown")}/${argv[1] ? basename(argv[1]) : "-"}/${role}`,
+      nonceMatch: nonce === undefined ? "unavailable" : String(argv.includes(nonce)),
+    }];
+  });
+  const rows = members.slice(0, 8).map((member) => `{pid=${member.pid} ppid=${member.ppid} pgid=${member.pgid} state=${member.state} command=${member.command} nonceMatch=${member.nonceMatch}}`).join(";");
+  return `GROUP_DIAGNOSTIC groupId=${String(groupId)} rows=[${rows}] omitted=${String(Math.max(0, members.length - 8))} unparsed=${String(unparsed)}`;
+}
+
+async function withGroupDiagnostic<T>(group: NonNullable<FoundationEvidence["processGroup"]>, action: () => Promise<T>): Promise<T> {
+  try { return await action(); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}\n${groupDiagnostic(group.groupId, group.nonce)}`, { cause: error });
+  }
+}
+
+function groupAlive(groupId: number, nonce?: string): boolean {
   const state = probeProcessGroup(groupId);
-  if (state === "unknown") throw new Error("Group presence could not be established");
+  if (state === "unknown") throw new Error(`Group presence could not be established\n${groupDiagnostic(groupId, nonce)}`);
   return state === "present";
 }
 
@@ -113,7 +152,7 @@ if (cli) {
       let prepared: Awaited<ReturnType<typeof runFoundationPhase>> | undefined;
       try {
         prepared = await runFoundationPhase({ target: localTarget, phase: "prepare", scenario: "process-interrupt", evidence });
-        const interrupted = await runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence });
+        const interrupted = await withGroupDiagnostic(prepared.processGroup!, () => runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }));
         expect(interrupted.processGroup?.cleanup).toBe("absent");
         await expect(runFoundationPhase({ target: localTarget, phase: "resume", scenario: "process-interrupt", evidence }))
           .resolves.toMatchObject({ status: "resumed", counters: { prepare: 1, interrupt: 1, resume: 1, verify: 0 } });
@@ -155,7 +194,7 @@ if (cli) {
         const pidPath = paths.find((path) => path.endsWith("qualification-group.json.pid"));
         expect(pidPath).toBeDefined();
         const groupId = Number(await readFile(join(root, pidPath!), "utf8"));
-        expect(groupAlive(groupId)).toBe(false);
+        expect(groupAlive(groupId), groupDiagnostic(groupId)).toBe(false);
         await expect(readFile(evidence)).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
         delete process.env.CODEFLOW_TEST_QUALIFICATION_MARKER;
@@ -233,7 +272,7 @@ if (cli) {
           target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence, now: () => later,
         }))
           .rejects.toThrow("STALE_QUALIFICATION_EVIDENCE");
-        expect(groupAlive(prepared.processGroup!.groupId)).toBe(false);
+        expect(groupAlive(prepared.processGroup!.groupId, prepared.processGroup!.nonce), groupDiagnostic(prepared.processGroup!.groupId, prepared.processGroup!.nonce)).toBe(false);
       } finally {
         if (prepared.processGroup) try { process.kill(-prepared.processGroup.groupId, "SIGKILL"); } catch {}
         await rm(root, { recursive: true, force: true });
@@ -248,7 +287,7 @@ if (cli) {
         await writeFile(evidence, `${JSON.stringify(forgeEvidence(prepared, { preparedBootId: `forged-${prepared.preparedBootId}` }))}\n`);
         await expect(runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }))
           .rejects.toThrow("QUALIFICATION_STATE_MISMATCH");
-        expect(groupAlive(prepared.processGroup!.groupId)).toBe(false);
+        expect(groupAlive(prepared.processGroup!.groupId, prepared.processGroup!.nonce), groupDiagnostic(prepared.processGroup!.groupId, prepared.processGroup!.nonce)).toBe(false);
       } finally {
         if (prepared.processGroup) await stopGroup(prepared.processGroup.groupId);
         await rm(root, { recursive: true, force: true });
@@ -286,7 +325,7 @@ if (cli) {
         await expect(runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }))
           .rejects.toThrow("QUALIFICATION_STATE_MISMATCH");
         expect(await readFile(evidence, "utf8")).toBe(before);
-        expect(groupAlive(prepared.processGroup!.groupId)).toBe(false);
+        expect(groupAlive(prepared.processGroup!.groupId, prepared.processGroup!.nonce), groupDiagnostic(prepared.processGroup!.groupId, prepared.processGroup!.nonce)).toBe(false);
       } finally {
         if (prepared.processGroup) await stopGroup(prepared.processGroup.groupId);
         await rm(root, { recursive: true, force: true });
@@ -346,7 +385,7 @@ if (cli) {
         expect(await readFile(evidence, "utf8")).toBe(before);
         await waitForProcessAbsent(marker.childPid);
         expect(processAlive(marker.childPid)).toBe(false);
-        expect(groupAlive(prepared.processGroup!.groupId)).toBe(false);
+        expect(groupAlive(prepared.processGroup!.groupId, prepared.processGroup!.nonce), groupDiagnostic(prepared.processGroup!.groupId, prepared.processGroup!.nonce)).toBe(false);
       } finally {
         if (prepared.processGroup) await stopGroup(prepared.processGroup.groupId);
         await rm(root, { recursive: true, force: true });
@@ -362,7 +401,7 @@ if (cli) {
         await copyFile(first, second);
         await expect(runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence: second }))
           .rejects.toThrow("QUALIFICATION_LINEAGE_MISMATCH");
-        expect(groupAlive(prepared.processGroup!.groupId)).toBe(false);
+        expect(groupAlive(prepared.processGroup!.groupId, prepared.processGroup!.nonce), groupDiagnostic(prepared.processGroup!.groupId, prepared.processGroup!.nonce)).toBe(false);
       } finally {
         if (prepared.processGroup) await stopGroup(prepared.processGroup.groupId);
         await rm(root, { recursive: true, force: true });
@@ -374,7 +413,7 @@ if (cli) {
       const evidence = relative(process.cwd(), join(root, "process.json"));
       const prepared = await runFoundationPhase({ target: localTarget, phase: "prepare", scenario: "process-interrupt", evidence });
       try {
-        await runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence });
+        await withGroupDiagnostic(prepared.processGroup!, () => runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }));
         const outcomes = await Promise.allSettled([
           runFoundationPhase({ target: localTarget, phase: "resume", scenario: "process-interrupt", evidence }),
           runFoundationPhase({ target: localTarget, phase: "resume", scenario: "process-interrupt", evidence }),
