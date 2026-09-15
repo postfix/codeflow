@@ -278,11 +278,7 @@ async function waitForChildExit(child: ChildProcess): Promise<boolean> {
 async function waitForQualificationChild(groupId: number, nonce: string): Promise<void> {
   const child = qualificationChildren.get(nonce);
   if (child?.pid !== groupId) return;
-  const release = () => {
-    if (qualificationChildren.get(nonce) === child) qualificationChildren.delete(nonce);
-  };
-  child.once("exit", release);
-  if (await waitForChildExit(child)) release();
+  await waitForChildExit(child);
 }
 
 async function reapStartedGroup(child: ChildProcess, groupId: number, nonce: string): Promise<void> {
@@ -309,6 +305,15 @@ async function startQualificationGroup(repository: string, workspace: string): P
     const marked = JSON.parse((await readBoundedFile(marker, 4_096)).toString("utf8")) as Record<string, unknown>;
     if (marked.pid !== child.pid || marked.nonce !== nonce) throw new Error("Qualification process identity mismatch");
     qualificationChildren.set(nonce, child);
+    const release = () => {
+      child.off("exit", release);
+      if (qualificationChildren.get(nonce) === child) qualificationChildren.delete(nonce);
+    };
+    if (child.exitCode !== null || child.signalCode !== null) release();
+    else {
+      child.once("exit", release);
+      if (child.exitCode !== null || child.signalCode !== null) release();
+    }
     child.unref();
     return { groupId: child.pid, nonce, cleanup: "pending", detail: "owned group is live" };
   } catch (error) {

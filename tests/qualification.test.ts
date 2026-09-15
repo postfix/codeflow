@@ -166,7 +166,10 @@ if (cli) {
     test("unknown ownership never permits fallback hard-kill cleanup", async () => {
       const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
       const evidence = relative(process.cwd(), join(root, "process.json"));
+      const unrefs = vi.spyOn(ChildProcess.prototype, "unref");
+      const deletes = vi.spyOn(Map.prototype, "delete");
       const prepared = await runFoundationPhase({ target: localTarget, phase: "prepare", scenario: "process-interrupt", evidence });
+      const leader = (unrefs.mock.contexts as ChildProcess[]).find((child) => child.pid === prepared.processGroup!.groupId)!;
       const signals = vi.spyOn(process, "kill");
       process.env.CODEFLOW_TEST_QUALIFICATION_GROUP_STATE = "unknown";
       try {
@@ -174,9 +177,15 @@ if (cli) {
           .rejects.toThrow("PROCESS_GROUP_ABSENCE_UNPROVED");
         expect(signals.mock.calls.some(([groupId, signal]) => groupId === -prepared.processGroup!.groupId && signal === "SIGKILL"))
           .toBe(false);
+        delete process.env.CODEFLOW_TEST_QUALIFICATION_GROUP_STATE;
+        try { process.kill(-prepared.processGroup!.groupId, "SIGKILL"); } catch {}
+        if (leader.exitCode === null && leader.signalCode === null) await new Promise<void>((resolveExit) => leader.once("exit", () => resolveExit()));
+        expect(deletes.mock.calls.some(([key]) => key === prepared.processGroup!.nonce)).toBe(true);
       } finally {
         delete process.env.CODEFLOW_TEST_QUALIFICATION_GROUP_STATE;
         signals.mockRestore();
+        deletes.mockRestore();
+        unrefs.mockRestore();
         try { process.kill(-prepared.processGroup!.groupId, "SIGKILL"); } catch {}
         await rm(root, { recursive: true, force: true });
       }
@@ -354,14 +363,21 @@ if (cli) {
     test("an absent group before interrupt cannot produce passing evidence", async () => {
       const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
       const evidence = relative(process.cwd(), join(root, "process.json"));
+      const unrefs = vi.spyOn(ChildProcess.prototype, "unref");
+      const deletes = vi.spyOn(Map.prototype, "delete");
       const prepared = await runFoundationPhase({ target: localTarget, phase: "prepare", scenario: "process-interrupt", evidence });
+      const leader = (unrefs.mock.contexts as ChildProcess[]).find((child) => child.pid === prepared.processGroup!.groupId)!;
       try {
         await stopGroup(prepared.processGroup!.groupId);
         const before = await readFile(evidence, "utf8");
         await expect(runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }))
           .rejects.toThrow("PROCESS_INTERRUPT_NOT_OBSERVED");
         expect(await readFile(evidence, "utf8")).toBe(before);
+        expect(deletes.mock.calls.some(([key]) => key === prepared.processGroup!.nonce)).toBe(true);
+        expect(leader.listenerCount("exit")).toBe(0);
       } finally {
+        deletes.mockRestore();
+        unrefs.mockRestore();
         if (prepared.processGroup) await stopGroup(prepared.processGroup.groupId);
         await rm(root, { recursive: true, force: true });
       }
