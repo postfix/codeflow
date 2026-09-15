@@ -1,0 +1,6 @@
+name: codeflow-limits-before-prepare
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["reserveLimits"]}}
+operation: {calls: {name: ["prepareAttempt"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

@@ -1,0 +1,6 @@
+name: codeflow-authorization-before-execution
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["commitAuthorization"]}}
+operation: {calls: {name: ["authorizeTarget"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

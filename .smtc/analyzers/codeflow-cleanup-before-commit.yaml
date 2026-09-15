@@ -1,0 +1,6 @@
+name: codeflow-cleanup-before-commit
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["assertGroupAbsent"]}}
+operation: {calls: {name: ["commitOutcome"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

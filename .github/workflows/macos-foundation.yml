@@ -1,0 +1,29 @@
+name: macOS foundation
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  qualify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test -- --run tests/storage.test.ts tests/ownership-process.test.ts tests/qualification.test.ts
+      - run: npm run test:foundation -- --target macos-github --phase prepare --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
+      - run: npm run test:foundation -- --target macos-github --phase interrupt --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
+      - run: npm run test:foundation -- --target macos-github --phase resume --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
+      - run: npm run test:foundation -- --target macos-github --phase verify --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-foundation
+          path: .coding-flow-qualification/macos-github-process.json

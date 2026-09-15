@@ -1,0 +1,6 @@
+name: codeflow-freshness-before-prepare
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["assertFresh"]}}
+operation: {calls: {name: ["prepareAttempt"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

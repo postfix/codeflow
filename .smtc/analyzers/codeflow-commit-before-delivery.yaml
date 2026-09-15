@@ -1,0 +1,6 @@
+name: codeflow-commit-before-delivery
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["commitOutcome"]}}
+operation: {calls: {name: ["deliverOutcome"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

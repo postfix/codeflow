@@ -1,0 +1,6 @@
+name: codeflow-provider-preflight-before-dispatch
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["preflightProvider"]}}
+operation: {calls: {name: ["buildProviderInvocation"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

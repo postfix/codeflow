@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.coding-flow/
+.coding-flow-qualification/
+.smtc-cache/
+spikes/native-host/results/*
+!spikes/native-host/results/.gitkeep

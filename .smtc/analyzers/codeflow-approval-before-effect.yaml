@@ -1,0 +1,6 @@
+name: codeflow-approval-before-effect
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["requireCommittedApprovalGateOpened"]}}
+operation: {calls: {name: ["authorizeApprovedEffect"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

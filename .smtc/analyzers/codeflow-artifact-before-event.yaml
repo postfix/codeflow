@@ -1,0 +1,6 @@
+name: codeflow-artifact-before-event
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["publishArtifact"]}}
+operation: {calls: {name: ["appendEventWithArtifacts"]}}
+relation: {must_dominate: true, allow_caller_paths: false}

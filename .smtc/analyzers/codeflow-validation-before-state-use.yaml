@@ -1,0 +1,6 @@
+name: codeflow-validation-before-state-use
+kind: ordered_obligation
+severity: high
+guard: {calls: {name: ["validateEnvelope"]}}
+operation: {calls: {name: ["applyMessage"]}}
+relation: {must_dominate: true, allow_caller_paths: false}
