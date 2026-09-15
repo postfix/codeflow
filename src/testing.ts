@@ -11,7 +11,8 @@ import { artifactRefSchema, canonicalJson, type Json } from "./contracts.js";
 import type { RunOptions } from "./host.js";
 import { Journal, readVerifiedEvents } from "./journal.js";
 import { acquireOwnership } from "./ownership.js";
-import { ProcessService } from "./process.js";
+import { inspectDarwinProcessGroup, probeProcessGroup, ProcessService } from "./process.js";
+export { classifyDarwinProcessGroup, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity } from "./process.js";
 
 export interface TestControl {
   readonly crashAfterRunCreated?: boolean;
@@ -260,7 +261,7 @@ async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
 }
 
 async function reapStartedGroup(child: ChildProcess, groupId: number, nonce: string): Promise<void> {
-  try { process.kill(-groupId, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+  if (ownedGroupState(groupId, nonce) === "present") try { process.kill(-groupId, "SIGKILL"); } catch {}
   if (child.exitCode === null && child.signalCode === null) {
     await new Promise<void>((resolveExit) => {
       const timeout = setTimeout(resolveExit, 5_000);
@@ -295,40 +296,6 @@ async function startQualificationGroup(repository: string, workspace: string): P
   }
 }
 
-interface DarwinProcessIdentity {
-  readonly pid: number;
-  readonly processGroup: number;
-  readonly argv: readonly string[];
-}
-
-function parseDarwinProcessIdentities(output: string): DarwinProcessIdentity[] | undefined {
-  const rows = output.split(/\r?\n/).map((row) => row.trim()).filter(Boolean);
-  if (rows.length === 0) return undefined;
-  const parsed: DarwinProcessIdentity[] = [];
-  for (const row of rows) {
-    const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(row);
-    if (!match) return undefined;
-    const pid = Number(match[1]);
-    const processGroup = Number(match[2]);
-    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(processGroup) || processGroup <= 0) return undefined;
-    parsed.push({ pid, processGroup, argv: match[3]!.trim().split(/\s+/) });
-  }
-  if (new Set(parsed.map(({ pid }) => pid)).size !== parsed.length) return undefined;
-  return parsed;
-}
-
-export function matchesDarwinProcessIdentity(output: string, groupId: number, nonce: string): boolean {
-  const rows = parseDarwinProcessIdentities(output);
-  return rows?.length === 1 && rows[0]!.pid === groupId && rows[0]!.processGroup === groupId && rows[0]!.argv.includes(nonce);
-}
-
-export function matchesDarwinGroupMemberIdentity(output: string, groupId: number, nonce: string): boolean {
-  const rows = parseDarwinProcessIdentities(output);
-  return rows !== undefined
-    && rows.every(({ processGroup }) => processGroup === groupId)
-    && rows.some(({ argv }) => argv.includes(nonce));
-}
-
 function linuxStatProcessGroup(stat: string): number | undefined {
   const commandEnd = stat.lastIndexOf(")");
   if (commandEnd < 0) return undefined;
@@ -357,30 +324,30 @@ function ownedGroupStillMatches(groupId: number, nonce: string): boolean {
     try { return linuxGroupHasNonceMember(groupId, nonce); } catch { return false; }
   }
   if (platform() === "darwin") {
-    try {
-      const output = execFileSync("/bin/ps", ["-o", "pid=", "-o", "pgid=", "-o", "command=", "-p", String(groupId)], { encoding: "utf8" });
-      if (matchesDarwinProcessIdentity(output, groupId, nonce)) return true;
-    } catch {}
-    try {
-      const output = execFileSync("/bin/ps", ["-o", "pid=", "-o", "pgid=", "-o", "command=", "-g", String(groupId)], { encoding: "utf8" });
-      return matchesDarwinGroupMemberIdentity(output, groupId, nonce);
-    } catch {}
+    return inspectDarwinProcessGroup(groupId, nonce) === "present";
   }
   return false;
 }
 
+function ownedGroupState(groupId: number, nonce: string): ReturnType<typeof probeProcessGroup> {
+  if (process.env.CODEFLOW_TEST_QUALIFICATION_GROUP_STATE === "unknown") return "unknown";
+  const state = probeProcessGroup(groupId, nonce);
+  if (state !== "present" || ownedGroupStillMatches(groupId, nonce)) return state;
+  return probeProcessGroup(groupId) === "absent" ? "absent" : "unknown";
+}
+
 async function interruptQualificationGroup(group: NonNullable<FoundationEvidence["processGroup"]>, preparedBootId: string): Promise<NonNullable<FoundationEvidence["processGroup"]>> {
   if (currentBootId() !== preparedBootId) return { ...group, cleanup: "uncertain", detail: "boot changed; stale process identity was not signalled" };
-  try {
-    process.kill(-group.groupId, 0);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ESRCH") throw new Error("PROCESS_INTERRUPT_NOT_OBSERVED");
-    return { ...group, cleanup: "uncertain", detail: "group presence could not be established" };
-  }
-  if (!ownedGroupStillMatches(group.groupId, group.nonce)) return { ...group, cleanup: "uncertain", detail: "live group identity could not be matched; no signal sent" };
+  const state = ownedGroupState(group.groupId, group.nonce);
+  if (state === "absent") throw new Error("PROCESS_INTERRUPT_NOT_OBSERVED");
+  if (state === "unknown") return { ...group, cleanup: "uncertain", detail: "group presence could not be established" };
   process.kill(-group.groupId, "SIGTERM");
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
-  try { process.kill(-group.groupId, "SIGKILL"); } catch {}
+  const hardKillState = ownedGroupState(group.groupId, group.nonce);
+  if (hardKillState === "unknown") {
+    return { ...group, cleanup: "uncertain", detail: "owned group identity could not be revalidated; no SIGKILL sent" };
+  }
+  if (hardKillState === "present") try { process.kill(-group.groupId, "SIGKILL"); } catch {}
   const service = new ProcessService();
   try {
     await service.assertGroupAbsent({ groupId: group.groupId, nonce: group.nonce });
@@ -393,7 +360,7 @@ async function interruptQualificationGroup(group: NonNullable<FoundationEvidence
 }
 
 async function reapQualificationGroup(group: FoundationEvidence["processGroup"], preparedBootId: string): Promise<void> {
-  if (!group || currentBootId() !== preparedBootId || !ownedGroupStillMatches(group.groupId, group.nonce)) return;
+  if (!group || currentBootId() !== preparedBootId || ownedGroupState(group.groupId, group.nonce) !== "present") return;
   try { process.kill(-group.groupId, "SIGKILL"); } catch {}
   const service = new ProcessService();
   try { await service.assertGroupAbsent({ groupId: group.groupId, nonce: group.nonce }); } catch {}

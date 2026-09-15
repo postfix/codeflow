@@ -1,12 +1,79 @@
-import { fork, type ChildProcess } from "node:child_process";
+import { fork, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, ftruncateSync, openSync, readSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
+import { platform } from "node:os";
 import { fileURLToPath } from "node:url";
 
 export interface ProcessIdentity {
   readonly groupId: number;
   readonly nonce: string;
+}
+
+export type ProcessGroupState = "present" | "absent" | "unknown";
+
+interface DarwinProcessIdentity {
+  readonly pid: number;
+  readonly processGroup: number;
+  readonly argv: readonly string[];
+}
+
+function parseDarwinProcessIdentities(output: string): DarwinProcessIdentity[] | undefined {
+  const rows = output.split(/\r?\n/).map((row) => row.trim()).filter(Boolean);
+  const parsed: DarwinProcessIdentity[] = [];
+  for (const row of rows) {
+    const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(row);
+    if (!match) return undefined;
+    const pid = Number(match[1]);
+    const processGroup = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(processGroup) || processGroup <= 0) return undefined;
+    parsed.push({ pid, processGroup, argv: match[3]!.trim().split(/\s+/) });
+  }
+  return new Set(parsed.map(({ pid }) => pid)).size === parsed.length ? parsed : undefined;
+}
+
+export function matchesDarwinProcessIdentity(output: string, groupId: number, nonce: string): boolean {
+  const rows = parseDarwinProcessIdentities(output);
+  return rows?.length === 1 && rows[0]!.pid === groupId && rows[0]!.processGroup === groupId && rows[0]!.argv.includes(nonce);
+}
+
+export function matchesDarwinGroupMemberIdentity(output: string, groupId: number, nonce: string): boolean {
+  const rows = parseDarwinProcessIdentities(output);
+  return rows !== undefined && rows.length > 0
+    && rows.every(({ processGroup }) => processGroup === groupId)
+    && rows.some(({ argv }) => argv.includes(nonce));
+}
+
+export function classifyDarwinProcessGroup(output: string, groupId: number, nonce?: string): ProcessGroupState {
+  if (output.trim() === "") return "unknown";
+  const rows = parseDarwinProcessIdentities(output);
+  if (rows === undefined) return "unknown";
+  const members = rows.filter(({ processGroup }) => processGroup === groupId);
+  if (members.length === 0) return "absent";
+  return nonce === undefined || members.some(({ argv }) => argv.includes(nonce)) ? "present" : "unknown";
+}
+
+export function inspectDarwinProcessGroup(groupId: number, nonce?: string): ProcessGroupState {
+  if (!Number.isSafeInteger(groupId) || groupId <= 1) return "unknown";
+  const result = spawnSync("/bin/ps", ["-ax", "-o", "pid=", "-o", "pgid=", "-o", "command="], {
+    encoding: "utf8",
+    timeout: 1_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return result.error || result.status !== 0 ? "unknown" : classifyDarwinProcessGroup(result.stdout, groupId, nonce);
+}
+
+export function probeProcessGroup(groupId: number, nonce?: string): ProcessGroupState {
+  if (!Number.isSafeInteger(groupId) || groupId <= 1) return "unknown";
+  try {
+    process.kill(-groupId, 0);
+    return "present";
+  } catch (error) {
+    const code = error instanceof Error && "code" in error ? error.code : undefined;
+    if (code === "ESRCH") return "absent";
+    if (code !== "EPERM" || platform() !== "darwin") return "unknown";
+  }
+  return inspectDarwinProcessGroup(groupId, nonce);
 }
 
 export interface ProcessRequest {
@@ -308,12 +375,9 @@ export class ProcessService {
     }
     const deadline = Date.now() + timeoutMs;
     while (true) {
-      try {
-        process.kill(-identity.groupId, 0);
-      } catch (error) {
-        if (error instanceof Error && "code" in error && error.code === "ESRCH") return;
-        throw new Error("OWNER_UNVERIFIED");
-      }
+      const state = probeProcessGroup(identity.groupId, identity.nonce);
+      if (state === "absent") return;
+      if (state === "unknown") throw new Error("OWNER_UNVERIFIED");
       if (Date.now() >= deadline) throw new Error("OWNER_UNVERIFIED");
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
     }

@@ -9,10 +9,10 @@ jobs:
   qualify:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24.19.0
           cache: npm
@@ -23,7 +23,7 @@ jobs:
       - run: npm run test:foundation -- --target macos-github --phase interrupt --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
       - run: npm run test:foundation -- --target macos-github --phase resume --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
       - run: npm run test:foundation -- --target macos-github --phase verify --scenario process-interrupt --evidence .coding-flow-qualification/macos-github-process.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-foundation
           path: .coding-flow-qualification/macos-github-process.json

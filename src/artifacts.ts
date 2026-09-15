@@ -92,12 +92,16 @@ export async function writeDurable(path: string, bytes: Uint8Array, hooks: Durab
 }
 
 export async function publishJson(runDirectory: string, path: string, value: Json): Promise<ArtifactRef> {
-  const root = await realpath(runDirectory);
+  const lexicalRoot = resolve(runDirectory);
   const candidate = resolve(path);
-  if (isOutside(root, candidate)) throw new Error("Artifact escapes run directory");
+  if (isOutside(lexicalRoot, candidate)) throw new Error("Artifact escapes run directory");
+  const root = await realpath(lexicalRoot);
   const parent = await realpath(dirname(candidate));
-  if (isOutside(root, parent) || parent !== dirname(candidate)) throw new Error("Artifact escapes run directory");
-  await lstat(candidate).then(
+  const canonicalCandidate = join(parent, basename(candidate));
+  if (isOutside(root, parent) || parent !== resolve(root, relative(lexicalRoot, dirname(candidate)))) {
+    throw new Error("Artifact escapes run directory");
+  }
+  await lstat(canonicalCandidate).then(
     () => { throw new Error("Artifact already exists"); },
     (error: unknown) => {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -105,9 +109,9 @@ export async function publishJson(runDirectory: string, path: string, value: Jso
   );
   const bytes = Buffer.from(`${canonicalJson(value)}\n`, "utf8");
   if (bytes.length > MAX_JSON_BYTES) throw new Error("Artifact exceeds 1 MiB JSON limit");
-  await writeDurable(candidate, bytes);
+  await writeDurable(canonicalCandidate, bytes);
   return {
-    path: relative(root, candidate),
+    path: relative(root, canonicalCandidate),
     sha256: createHash("sha256").update(bytes).digest("hex"),
     bytes: bytes.length,
     mediaType: "application/json",

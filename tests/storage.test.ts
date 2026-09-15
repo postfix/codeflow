@@ -81,6 +81,22 @@ describe("durable storage", () => {
     await expect(publishJson(root, join(root, "../escape.json"), {})).rejects.toThrow("escapes run directory");
   });
 
+  test("artifact publication allows an aliased ancestor but rejects a symlink inside the run", async () => {
+    const root = await directory();
+    const physical = join(root, "private");
+    const run = join(physical, "run");
+    await mkdir(join(run, "real"), { recursive: true });
+    await symlink(physical, join(root, "alias"));
+    const aliasedRun = join(root, "alias", "run");
+
+    await expect(publishJson(aliasedRun, join(aliasedRun, "value.json"), {}))
+      .resolves.toHaveProperty("path", "value.json");
+
+    await symlink(join(run, "real"), join(run, "linked"));
+    await expect(publishJson(aliasedRun, join(aliasedRun, "linked", "escape.json"), {}))
+      .rejects.toThrow("escapes run directory");
+  });
+
   test("artifact verification rejects tampering, oversized metadata, and symlinks", async () => {
     const root = await directory();
     await mkdir(join(root, "artifacts"));

@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { canonicalJson, type Json } from "../src/contracts.js";
-import { assertFoundationTarget, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity, runFoundationPhase, type FoundationEvidence, type FoundationOptions } from "../src/testing.js";
+import { assertFoundationTarget, classifyDarwinProcessGroup, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity, runFoundationPhase, type FoundationEvidence, type FoundationOptions } from "../src/testing.js";
+import { probeProcessGroup } from "../src/process.js";
 
 const localTarget = process.platform === "darwin" ? "macos-github" : "linux-local";
 const mismatchedTarget = localTarget === "linux-local" ? "macos-github" : "linux-local";
@@ -17,11 +18,9 @@ function forgeEvidence(evidence: FoundationEvidence, changes: Partial<Foundation
 }
 
 function groupAlive(groupId: number): boolean {
-  try { process.kill(-groupId, 0); return true; }
-  catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ESRCH") return false;
-    throw error;
-  }
+  const state = probeProcessGroup(groupId);
+  if (state === "unknown") throw new Error("Group presence could not be established");
+  return state === "present";
 }
 
 function processAlive(processId: number): boolean {
@@ -76,7 +75,7 @@ if (cli) {
     evidenceHash: evidence.evidenceHash,
   })}\n`);
 } else {
-  const { describe, expect, test } = await import("vitest");
+  const { describe, expect, test, vi } = await import("vitest");
 
   describe("foundation qualification", () => {
     test("runtime classes treat WSL2 as Linux and reserve reboot evidence for Linux", async () => {
@@ -125,6 +124,25 @@ if (cli) {
         await rm(root, { recursive: true, force: true });
       }
     }, 20_000);
+
+    test("unknown ownership never permits fallback hard-kill cleanup", async () => {
+      const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
+      const evidence = relative(process.cwd(), join(root, "process.json"));
+      const prepared = await runFoundationPhase({ target: localTarget, phase: "prepare", scenario: "process-interrupt", evidence });
+      const signals = vi.spyOn(process, "kill");
+      process.env.CODEFLOW_TEST_QUALIFICATION_GROUP_STATE = "unknown";
+      try {
+        await expect(runFoundationPhase({ target: localTarget, phase: "interrupt", scenario: "process-interrupt", evidence }))
+          .rejects.toThrow("PROCESS_GROUP_ABSENCE_UNPROVED");
+        expect(signals.mock.calls.some(([groupId, signal]) => groupId === -prepared.processGroup!.groupId && signal === "SIGKILL"))
+          .toBe(false);
+      } finally {
+        delete process.env.CODEFLOW_TEST_QUALIFICATION_GROUP_STATE;
+        signals.mockRestore();
+        try { process.kill(-prepared.processGroup!.groupId, "SIGKILL"); } catch {}
+        await rm(root, { recursive: true, force: true });
+      }
+    });
 
     test("an incomplete readiness marker cannot become ready or orphan its group", async () => {
       const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
@@ -288,6 +306,11 @@ if (cli) {
       expect(matchesDarwinGroupMemberIdentity(`99 42 /usr/local/bin/node fixture.mjs prefix-${nonce}-suffix\n`, 42, nonce)).toBe(false);
       expect(matchesDarwinGroupMemberIdentity(`99 42 /usr/local/bin/node fixture.mjs ${nonce}\nmalformed\n`, 42, nonce)).toBe(false);
       expect(matchesDarwinGroupMemberIdentity(`99 41 /usr/local/bin/node fixture.mjs ${nonce}\n`, 42, nonce)).toBe(false);
+      expect(classifyDarwinProcessGroup("", 42, nonce)).toBe("unknown");
+      expect(classifyDarwinProcessGroup("99 99 /sbin/launchd\n", 42, nonce)).toBe("absent");
+      expect(classifyDarwinProcessGroup(`99 42 /usr/local/bin/node fixture.mjs ${nonce}\n`, 42, nonce)).toBe("present");
+      expect(classifyDarwinProcessGroup("99 42 /usr/local/bin/node fixture.mjs different-nonce\n", 42, nonce)).toBe("unknown");
+      expect(classifyDarwinProcessGroup("not ps output", 42, nonce)).toBe("unknown");
     });
 
     test("an absent group before interrupt cannot produce passing evidence", async () => {
