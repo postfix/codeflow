@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -8,7 +8,7 @@ const sdk = new URL("../src/sdk.ts", import.meta.url).pathname;
 const temporary: string[] = [];
 
 async function workspace(name: string): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), `codeflow-cli-${name}-`));
+  const root = await realpath(await mkdtemp(join(tmpdir(), `codeflow-cli-${name}-`)));
   temporary.push(root);
   return root;
 }

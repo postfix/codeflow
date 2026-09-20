@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -12,7 +12,7 @@ import type { Adapter } from "../src/adapters/types.js";
 const temporary: string[] = [];
 
 async function directory(): Promise<string> {
-  const path = await mkdtemp(join(tmpdir(), "codeflow-adapter-"));
+  const path = await realpath(await mkdtemp(join(tmpdir(), "codeflow-adapter-")));
   temporary.push(path);
   return path;
 }
