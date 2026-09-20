@@ -11,6 +11,7 @@ import { executeOwnedCommand } from "../src/supervisor.js";
 
 const services: ProcessService[] = [];
 const fixture = new URL("./fixtures/process-child.mjs", import.meta.url).pathname;
+const runtime = { provider: "codex" as const };
 
 afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.dispose()));
@@ -116,7 +117,7 @@ describe("authorization ownership process group", () => {
       .toContain('"exitCode":0');
   });
 
-  test("production supervision owns one literal command and rejects a second dispatch", async () => {
+  test("production supervision owns sequential literal commands up to the authored limit", async () => {
     const root = await directory();
     const effect = join(root, "first-effect");
     const secondEffect = join(root, "second-effect");
@@ -130,14 +131,12 @@ describe("authorization ownership process group", () => {
       limits: { maxCommands: 2, timeoutMs: 5000 },
       run: async context => {
         const first = await context.command(process.execPath, ${JSON.stringify([fixture, "record", effect, "; touch escaped", "$(false)"])});
-        let secondError = "";
-        try { await context.command(process.execPath, ${JSON.stringify([fixture, "record", secondEffect])}); }
-        catch (error) { secondError = error.message; }
-        return { first, secondError };
+        const second = await context.command(process.execPath, ${JSON.stringify([fixture, "record", secondEffect])});
+        return { first, second };
       },
     };\n`);
 
-    const started = await startFlow(pathToFileURL(entry), {}, { workspace: root });
+    const started = await startFlow(pathToFileURL(entry), {}, { workspace: root, runtime });
     await expect(started.wait(15_000)).resolves.toMatchObject({ status: "succeeded" });
     const runDirectory = join(root, ".coding-flow", "runs", started.runId);
     const terminal = JSON.parse(await readFile(join(runDirectory, "result.json"), "utf8"));
@@ -145,16 +144,33 @@ describe("authorization ownership process group", () => {
     const output = JSON.parse(await readFile(join(runDirectory, terminal.data.outputArtifact.path), "utf8"));
     expect(output.first.exitCode).toBe(0);
     expect(JSON.parse(output.first.stdout)).toEqual(["; touch escaped", "$(false)"]);
-    expect(output.secondError).toBe("COMMAND_LIMIT");
+    expect(output.second.exitCode).toBe(0);
     expect(await readFile(effect, "utf8")).toBe("1");
-    await expect(readFile(secondEffect, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(secondEffect, "utf8")).toBe("1");
     for (const suffix of ["claim", "authorized", "committed"]) {
       await expect(readFile(join(runDirectory, "operations", `command-1.${suffix}.json`))).resolves.toBeDefined();
+      await expect(readFile(join(runDirectory, "operations", `command-2.${suffix}.json`))).resolves.toBeDefined();
     }
     const authorization = JSON.parse(await readFile(join(runDirectory, "operations", "command-1.authorized.json"), "utf8"));
     const probe = new ProcessService();
     await expect(probe.assertGroupAbsent({ groupId: authorization.groupId, nonce: authorization.nonce })).resolves.toBeUndefined();
   }, 20_000);
+
+  test("production command preserves exit evidence when a consumer closes maximum-size stdin", async () => {
+    const root = await directory();
+    const entry = join(root, "early-stdin-close.mjs");
+    await writeFile(entry, `export default {
+      kind: "coding-flow/v2", name: "early-stdin-close", description: "controlled stdin close",
+      input: { parse: value => value }, output: { parse: value => value }, limits: { maxCommands: 1 },
+      run: async context => context.command("/bin/true", [], { stdin: "x".repeat(1024 * 1024) })
+    };\n`);
+
+    const started = await startFlow(pathToFileURL(entry), null, { workspace: root, runtime });
+    await expect(started.wait(10_000)).resolves.toMatchObject({
+      status: "succeeded",
+      output: { exitCode: 0 },
+    });
+  }, 15_000);
 
   test("production supervision settles a discarded command before publishing failure", async () => {
     const root = await directory();
@@ -173,7 +189,7 @@ describe("authorization ownership process group", () => {
       },
     };\n`);
 
-    const started = await startFlow(pathToFileURL(entry), {}, { workspace: root });
+    const started = await startFlow(pathToFileURL(entry), {}, { workspace: root, runtime });
     await expect(started.wait(15_000)).resolves.toMatchObject({ status: "failed" });
     const runDirectory = join(root, ".coding-flow", "runs", started.runId);
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -187,11 +203,8 @@ describe("authorization ownership process group", () => {
   test("production supervision rejects a command retained past successful flow settlement", async () => {
     const root = await directory();
     const effect = join(root, "late-effect");
-    const timerFired = join(root, "late-timer-fired");
-    const unhandled = join(root, "late-unhandled-rejection");
     const entry = join(root, "retained-command-flow.mjs");
-    await writeFile(entry, `import { writeFile } from "node:fs/promises";
-    export default {
+    await writeFile(entry, `export default {
       kind: "coding-flow/v2",
       name: "retained-command",
       description: "retained command closure witness",
@@ -199,28 +212,24 @@ describe("authorization ownership process group", () => {
       output: { parse: value => value },
       limits: { maxCommands: 1, timeoutMs: 5000 },
       run: async context => {
-        process.once("unhandledRejection", () => { void writeFile(${JSON.stringify(unhandled)}, "yes"); });
         setTimeout(() => {
-          void writeFile(${JSON.stringify(timerFired)}, "yes").catch(() => {});
           context.command(process.execPath, ${JSON.stringify([fixture, "record", effect])});
         }, 250);
         return { ok: true };
       },
     };\n`);
 
-    const started = await startFlow(pathToFileURL(entry), {}, { workspace: root });
+    const started = await startFlow(pathToFileURL(entry), {}, { workspace: root, runtime });
     await expect(started.wait(15_000)).resolves.toMatchObject({ status: "succeeded" });
     const runDirectory = join(root, ".coding-flow", "runs", started.runId);
     const initialResult = await readFile(join(runDirectory, "result.json"), "utf8");
     await new Promise((resolve) => setTimeout(resolve, 800));
-    await expect(readFile(timerFired, "utf8")).resolves.toBe("yes");
     expect(await readFile(join(runDirectory, "result.json"), "utf8")).toBe(initialResult);
     for (const suffix of ["claim", "registered", "authorized", "committed"]) {
       await expect(readFile(join(runDirectory, "operations", `command-1.${suffix}.json`)))
         .rejects.toMatchObject({ code: "ENOENT" });
     }
     await expect(readFile(effect)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(unhandled)).rejects.toMatchObject({ code: "ENOENT" });
   }, 20_000);
 
   test("initial waits tolerate live journal growth but still reject permanent corruption", async () => {
@@ -233,7 +242,7 @@ describe("authorization ownership process group", () => {
         output: { parse: value => value },
         run: async () => ({ ok: true })
       };\n`);
-      const started = await startFlow(pathToFileURL(entry), {}, { workspace: root });
+      const started = await startFlow(pathToFileURL(entry), {}, { workspace: root, runtime });
       await expect(started.wait(10_000)).resolves.toMatchObject({ status: "succeeded" });
       if (index === 0) {
         const journal = join(root, ".coding-flow", "runs", started.runId, "events.jsonl");

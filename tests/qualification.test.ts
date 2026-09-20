@@ -1,9 +1,13 @@
-import { ChildProcess } from "node:child_process";
+import { ChildProcess, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson, type Json } from "../src/contracts.js";
-import { assertFoundationTarget, classifyDarwinProcessGroup, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity, runFoundationPhase, type FoundationEvidence, type FoundationOptions } from "../src/testing.js";
+import { assertFoundationTarget, classifyDarwinProcessGroup, liveAcceptanceSubject, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity, runFoundationPhase, runLiveAcceptanceVerification, type FoundationEvidence, type FoundationOptions } from "../src/testing.js";
+import { readVerifiedEvents } from "../src/journal.js";
+import { startFlow, resumeRun } from "../src/host.js";
 import { probeProcessGroup } from "../src/process.js";
 
 const localTarget = process.platform === "darwin" ? "macos-github" : "linux-local";
@@ -50,7 +54,8 @@ function option(name: string): string | undefined {
 
 function cliOptions(): FoundationOptions | undefined {
   const target = option("target");
-  const phase = option("phase");
+  const requestedPhase = option("phase");
+  const phase = requestedPhase === "recover" ? "resume" : requestedPhase;
   const scenario = option("scenario");
   const evidence = option("evidence");
   if (!target && !phase && !scenario && !evidence) return undefined;
@@ -61,8 +66,19 @@ function cliOptions(): FoundationOptions | undefined {
   return { target, phase, scenario, evidence } as FoundationOptions;
 }
 
-const cli = cliOptions();
-if (cli) {
+const live = process.argv.includes("--host-acceptance");
+const cli = live ? undefined : cliOptions();
+if (live) {
+  const target = option("target");
+  const provider = option("provider");
+  const workspace = option("workspace");
+  const manifest = option("manifest");
+  const result = option("result");
+  if (target !== "linux-local" || (provider !== "codex" && provider !== "claude") || !workspace || !manifest || !result) {
+    throw new Error("Usage: --target linux-local --provider codex|claude --workspace PATH --manifest PATH --result PATH");
+  }
+  process.stdout.write(`${JSON.stringify(await runLiveAcceptanceVerification({ target, provider, workspace, manifest, result }))}\n`);
+} else if (cli) {
   const evidence = await runFoundationPhase(cli);
   process.stdout.write(`${JSON.stringify({
     ok: true,
@@ -77,6 +93,156 @@ if (cli) {
   })}\n`);
 } else {
   const { describe, expect, test, vi } = await import("vitest");
+
+  describe("live acceptance verification", () => {
+    test("foundation CLI accepts recover as the resume phase", async () => {
+      const root = await mkdtemp(join(process.cwd(), ".qualification-test-"));
+      try {
+        const entry = fileURLToPath(new URL("../dist/tests/qualification.test.js", import.meta.url));
+        for (const phase of ["resume", "recover"]) {
+          const result = spawnSync(process.execPath, [entry, "--target", localTarget, "--phase", phase,
+            "--scenario", "process-interrupt", "--evidence", join(root, "missing.json")], { encoding: "utf8" });
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain("INVALID_QUALIFICATION_EVIDENCE");
+        }
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
+    test("native evidence fixture subject includes the corrected native format files", async () => {
+      const repository = await mkdtemp(join(tmpdir(), "codeflow-native-subject-"));
+      const paths = ["tests/fixtures/host-flow.ts", "tests/fixtures/codex.jsonl", "tests/fixtures/claude.json", "tests/adapters.test.ts",
+        "src/adapters/types.ts", "src/adapters/codex.ts", "src/adapters/claude.ts", "src/testing.ts",
+        "tests/fixtures/codex-session.json", "tests/fixtures/claude.jsonl"];
+      try {
+        for (const path of paths) {
+          await mkdir(join(repository, path.split("/").slice(0, -1).join("/")), { recursive: true });
+          await writeFile(join(repository, path), path);
+        }
+        const first = await liveAcceptanceSubject(repository);
+        await writeFile(join(repository, "tests/fixtures/codex-session.json"), "changed");
+        expect((await liveAcceptanceSubject(repository)).fixtureSetSha256).not.toBe(first.fixtureSetSha256);
+      } finally { await rm(repository, { recursive: true, force: true }); }
+    });
+    test("rejects missing and ambiguous manifests without publishing a result", async () => {
+      const workspace = await mkdtemp(join(tmpdir(), "codeflow-live-invalid-"));
+      try {
+        await mkdir(join(workspace, ".coding-flow-qualification"));
+        const options = { target: "linux-local" as const, provider: "claude" as const, workspace,
+          manifest: ".coding-flow-qualification/input.json", result: ".coding-flow-qualification/result.json" };
+        await expect(runLiveAcceptanceVerification(options)).rejects.toThrow();
+        await writeFile(join(workspace, options.manifest), JSON.stringify({ version: 1, target: "linux-local", provider: "claude", forged: true }));
+        await expect(runLiveAcceptanceVerification(options)).rejects.toThrow();
+        await expect(readFile(join(workspace, options.result))).rejects.toMatchObject({ code: "ENOENT" });
+      } finally { await rm(workspace, { recursive: true, force: true }); }
+    });
+
+    test("verifies fixture consent recovery cancellation and refuses result collisions", async () => {
+      if (process.platform !== "linux") return;
+      const verify = (await import(new URL("../dist/src/testing.js", import.meta.url).href) as {
+        runLiveAcceptanceVerification: typeof runLiveAcceptanceVerification;
+      }).runLiveAcceptanceVerification;
+      const workspace = await mkdtemp(join(tmpdir(), "codeflow-live-valid-"));
+      try {
+        const entry = join(workspace, "host-flow.ts");
+        const source = await readFile(new URL("./fixtures/host-flow.ts", import.meta.url), "utf8");
+        const sdk = fileURLToPath(new URL("../dist/src/sdk.js", import.meta.url));
+        await writeFile(entry, source.replace("../../src/sdk.js", sdk));
+        const executable = join(workspace, "fixture-claude.mjs");
+        await writeFile(executable, `#!${process.execPath}\n
+          if (process.argv.includes('--version')) console.log('2.1.274 (Claude Code)');
+          else if (process.argv.includes('status')) console.log(JSON.stringify({loggedIn:true,authMethod:'claude.ai',apiProvider:'firstParty',subscriptionType:'max'}));
+          else { let prompt=''; for await (const chunk of process.stdin) prompt+=chunk;
+            if (!prompt.includes('{')) throw new Error('fixture stdin: '+JSON.stringify(prompt));
+            console.log(JSON.stringify({type:'system',subtype:'init',model:'fixture-model',session_id:'fixture-session'}));
+            console.log(JSON.stringify({type:'assistant',session_id:'fixture-session',parent_tool_use_id:null,message:{model:'fixture-model',content:[{type:'text',text:'synthetic fixture'}]}}));
+            console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,permission_denials:[],session_id:'fixture-session',structured_output:JSON.parse(prompt.slice(prompt.indexOf('{')))})); }
+        `, { mode: 0o700 });
+        const runtime = { provider: "claude" as const, executable, model: "fixture-model" };
+        const complete = async (recover: boolean) => {
+          let handle = await startFlow(pathToFileURL(entry), { message: "acceptance", delayMs: 0, acceptance: true }, { workspace, runtime });
+          const first = await handle.wait(15_000);
+          if (first.status === "blocked") {
+            const returned = await readFile(join(workspace, ".coding-flow/runs", handle.runId, "operations/agent-1.committed.json"), "utf8");
+            const claim = await readFile(join(workspace, ".coding-flow/runs", handle.runId, "operations/agent-1.claim.json"), "utf8");
+            throw new Error(`fixture provider blocked: ${returned}; claim: ${claim}`);
+          }
+          expect(first.status, JSON.stringify(first)).toBe("waiting-for-human");
+          if (first.status !== "waiting-for-human") throw new Error("missing first approval");
+          const before = (await readVerifiedEvents(workspace, handle.runId)).at(-1)!;
+          const respond = async (boundary: typeof first, submissionId: string, answer: Json) => handle.respond({ requestId: boundary.request.requestId,
+            revision: boundary.request.revision, presentationHash: boundary.request.presentationHash, submissionId, answer });
+          await respond(first, "first-denial", { decision: "reject", reason: "fixture denial" });
+          const second = await handle.wait(5_000);
+          if (second.status !== "waiting-for-human") throw new Error(`missing revision: ${JSON.stringify(second)}`);
+          await respond(second, "revision-approval", { decision: "approve", reason: "fixture approval" });
+          let checkpoint = await handle.wait(10_000);
+          if (checkpoint.status !== "waiting-for-human") throw new Error(`missing checkpoint: ${JSON.stringify(checkpoint)}`);
+          if (recover) {
+            const history = await readVerifiedEvents(workspace, handle.runId);
+            process.kill(Number((history[0]!.data as Record<string, Json>).supervisorPid), "SIGKILL");
+            await new Promise((done) => setTimeout(done, 100));
+            handle = await resumeRun(workspace, handle.runId);
+            checkpoint = await handle.wait(10_000);
+            if (checkpoint.status !== "waiting-for-human") throw new Error(`recovery checkpoint: ${JSON.stringify(checkpoint)}`);
+          }
+          await respond(checkpoint, "checkpoint", "continue");
+          expect(await handle.wait(10_000)).toMatchObject({ status: "succeeded" });
+          const after = (await readVerifiedEvents(workspace, handle.runId)).at(-1)!;
+          return { runId: handle.runId, before: `${handle.runId}:${before.sequence}:${before.hash}`, after: `${handle.runId}:${after.sequence}:${after.hash}` };
+        };
+        const happy = await complete(false);
+        const recovery = await complete(true);
+        const cancelled = await startFlow(pathToFileURL(entry), { message: "acceptance", delayMs: 60_000, acceptance: true }, { workspace, runtime });
+        await cancelled.cancel("fixture cancellation");
+        expect(await cancelled.wait(10_000)).toMatchObject({ status: "cancelled" });
+        await mkdir(join(workspace, ".coding-flow-qualification"));
+        const manifest = { version: 1, target: "linux-local", provider: "claude", ...await liveAcceptanceSubject(),
+          runs: { happyPath: happy.runId, interruptedRecovery: recovery.runId, cancellation: cancelled.runId },
+          hostSteps: { provenance: "operator-asserted", firstInvocationReceipt: happy.before, reconnectedInvocationReceipt: happy.after, contextClosedAndReopened: true } };
+        const options = { target: "linux-local" as const, provider: "claude" as const, workspace,
+          manifest: ".coding-flow-qualification/input.json", result: ".coding-flow-qualification/result.json" };
+        await writeFile(join(workspace, options.manifest), JSON.stringify(manifest));
+        expect(await verify(options)).toMatchObject({ human: { rejectionEffects: 0, approvalEffects: 1 }, recovery: { committedRedispatches: 0 } });
+        await expect(verify(options)).rejects.toMatchObject({ code: "EEXIST" });
+        const happyDirectory = join(workspace, ".coding-flow/runs", happy.runId);
+        const happyHistory = await readVerifiedEvents(workspace, happy.runId);
+        const terminalObservation = happyHistory.filter(({ type }) => type === "provider.observed").at(-1)!;
+        const observationRef = (terminalObservation.data as { observationArtifact: { path: string } }).observationArtifact;
+        const observation = JSON.parse(await readFile(join(happyDirectory, observationRef.path), "utf8")) as {
+          nativeEvidenceArtifact: { path: string };
+        };
+        const snapshotPath = join(happyDirectory, observation.nativeEvidenceArtifact.path);
+        const snapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as { stdoutArtifact: { path: string } };
+        const stdoutPath = join(happyDirectory, snapshot.stdoutArtifact.path);
+        for (const path of [snapshotPath, stdoutPath]) {
+          const bytes = await readFile(path);
+          await writeFile(path, Buffer.from("corrupted native evidence"));
+          const result = `.coding-flow-qualification/corrupt-${path === snapshotPath ? "snapshot" : "stdout"}.json`;
+          await expect(verify({ ...options, result })).rejects.toThrow();
+          await expect(readFile(join(workspace, result))).rejects.toMatchObject({ code: "ENOENT" });
+          await writeFile(path, bytes);
+          await rm(path);
+          const missing = `.coding-flow-qualification/missing-${path === snapshotPath ? "snapshot" : "stdout"}.json`;
+          await expect(verify({ ...options, result: missing })).rejects.toThrow();
+          await expect(readFile(join(workspace, missing))).rejects.toMatchObject({ code: "ENOENT" });
+          await writeFile(path, bytes);
+        }
+        const processPath = join(happyDirectory, "operations/agent-1.committed.json");
+        const processBytes = await readFile(processPath);
+        const processRecord = JSON.parse(processBytes.toString("utf8")) as Record<string, unknown>;
+        for (const [field, value] of [["exitCode", 1], ["signal", "SIGTERM"], ["error", "tampered"]] as const) {
+          await writeFile(processPath, JSON.stringify({ ...processRecord, [field]: value }));
+          const result = `.coding-flow-qualification/status-${field}.json`;
+          await expect(verify({ ...options, result })).rejects.toThrow();
+          await expect(readFile(join(workspace, result))).rejects.toMatchObject({ code: "ENOENT" });
+          await writeFile(processPath, processBytes);
+        }
+        await writeFile(join(workspace, options.manifest), JSON.stringify({ ...manifest, runs: { ...manifest.runs, interruptedRecovery: happy.runId } }));
+        await expect(verify({ ...options, result: ".coding-flow-qualification/invalid.json" })).rejects.toThrow("LIVE_MANIFEST_MISMATCH");
+        await expect(readFile(join(workspace, ".coding-flow-qualification/invalid.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      } finally { await rm(workspace, { recursive: true, force: true }); }
+    }, 60_000);
+  });
 
   describe("foundation qualification", () => {
     test("runtime classes treat WSL2 as Linux and reserve reboot evidence for Linux", async () => {

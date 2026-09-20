@@ -1,32 +1,43 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statfsSync, statSync } from "node:fs";
-import { lstat, mkdir } from "node:fs/promises";
+import { link, lstat, mkdir, open, rm, unlink } from "node:fs/promises";
 import { arch, platform, release } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { assertContainedPath, publishJson, readBoundedFile, syncDirectory, verifyArtifact, writeDurable } from "./artifacts.js";
-import { artifactRefSchema, canonicalJson, type Json } from "./contracts.js";
+import { artifactRefSchema, canonicalJson, runManifestSchema, type Json } from "./contracts.js";
 import type { RunOptions } from "./host.js";
-import { Journal, readVerifiedEvents } from "./journal.js";
+import { Journal, readProviderObservations, readVerifiedEvents, type DurableEvent } from "./journal.js";
+import { HumanCoordinator } from "./human.js";
+import { ReplayFrontier } from "./replay.js";
+import { buildFlow } from "./build.js";
+import { CODEX_VERSION, decodeCodexAuth, decodeCodexResult } from "./adapters/codex.js";
+import { CLAUDE_VERSION, decodeClaudeAuth, decodeClaudeResult } from "./adapters/claude.js";
+import { preflightProvider, ProviderFailure, type Adapter, type ProviderRequest } from "./adapters/types.js";
 import { acquireOwnership } from "./ownership.js";
 import { inspectDarwinProcessGroup, probeProcessGroup, ProcessService } from "./process.js";
 export { classifyDarwinProcessGroup, matchesDarwinGroupMemberIdentity, matchesDarwinProcessIdentity } from "./process.js";
 
 export interface TestControl {
   readonly crashAfterRunCreated?: boolean;
+  readonly fakeAgentResults?: readonly Json[];
+  readonly crashAt?: "after-human-reply" | "after-approval-gate" | "after-author-delivery" | "after-approval-effect";
 }
 
 const controls = new WeakMap<object, TestControl>();
 
-export function withTestControl(options: RunOptions, control: TestControl): RunOptions {
+type TestRunOptions = RunOptions;
+
+export function withTestControl<T extends TestRunOptions>(options: T, control: TestControl): T {
   const controlled = { ...options };
   controls.set(controlled, Object.freeze({ ...control }));
-  return controlled;
+  return controlled as T;
 }
 
-export function readTestControl(options: RunOptions): TestControl | undefined {
+export function readTestControl(options: object): TestControl | undefined {
   return controls.get(options);
 }
 
@@ -663,4 +674,215 @@ export async function runFoundationPhase(options: FoundationOptions): Promise<Fo
   } finally {
     lease.release();
   }
+}
+
+const liveDigest = z.string().regex(/^[0-9a-f]{64}$/);
+const liveManifestSchema = z.object({
+  version: z.literal(1), target: z.literal("linux-local"), provider: z.enum(["codex", "claude"]),
+  fixtureSha256: liveDigest, fixtureSetSha256: liveDigest,
+  runs: z.object({ happyPath: z.string().uuid(), interruptedRecovery: z.string().uuid(), cancellation: z.string().uuid() }).strict(),
+  hostSteps: z.object({ provenance: z.literal("operator-asserted"), firstInvocationReceipt: z.string().min(1).max(256),
+    reconnectedInvocationReceipt: z.string().min(1).max(256), contextClosedAndReopened: z.literal(true) }).strict(),
+}).strict();
+export type LiveAcceptanceManifestV1 = z.infer<typeof liveManifestSchema>;
+export interface LiveAcceptanceOptions {
+  readonly target: "linux-local";
+  readonly provider: "codex" | "claude";
+  readonly workspace: string;
+  readonly manifest: string;
+  readonly result: string;
+}
+export interface LiveAcceptanceEvidenceV1 {
+  readonly version: 1;
+  readonly requestedTarget: "linux-local";
+  readonly provider: "codex" | "claude";
+  readonly runtime: { readonly node: string; readonly os: "linux" };
+  readonly subject: { readonly fixtureSha256: string; readonly fixtureSetSha256: string; readonly bundleSha256: string };
+  readonly subscription: { readonly executableVersion: string; readonly auth: "subscription"; readonly requestedModel: string; readonly actualModel: string; readonly sessionIdSha256: string };
+  readonly human: { readonly rejectionEffects: 0; readonly approvalEffects: 1 };
+  readonly reconnection: { readonly sameRun: "verified"; readonly journalContinuity: "verified"; readonly contextRestart: "operator-asserted" };
+  readonly recovery: { readonly resumedAfterSupervisorInterrupt: true; readonly committedRedispatches: 0; readonly limitsPreserved: true };
+  readonly failures: { readonly preflightAuth: "fixture-qualified"; readonly claudePermission: "fixture-qualified"; readonly codexPostAuthorization: "conservative-unknown"; readonly claudeAuthOrQuota: "conservative-unknown"; readonly cancellation: "live-qualified" };
+  readonly evidenceHash: string;
+}
+
+const LIVE_FIXTURE_SET = ["tests/fixtures/host-flow.ts", "tests/fixtures/codex.jsonl", "tests/fixtures/codex-session.json", "tests/fixtures/claude.jsonl", "tests/adapters.test.ts", "src/adapters/types.ts", "src/adapters/codex.ts", "src/adapters/claude.ts", "src/testing.ts"] as const;
+export async function liveAcceptanceSubject(repository = process.cwd()): Promise<{ fixtureSha256: string; fixtureSetSha256: string }> {
+  const hash = createHash("sha256");
+  for (const path of LIVE_FIXTURE_SET) {
+    const bytes = await readBoundedFile(join(repository, path), 64 * 1024 * 1024);
+    hash.update(`${path}\0${bytes.length}\0`).update(bytes);
+  }
+  return { fixtureSha256: sha256(await readBoundedFile(join(repository, LIVE_FIXTURE_SET[0]), 64 * 1024 * 1024)), fixtureSetSha256: hash.digest("hex") };
+}
+
+function liveData(event: DurableEvent): Record<string, Json> {
+  if (typeof event.data !== "object" || event.data === null || Array.isArray(event.data)) throw new Error("LIVE_EVIDENCE_INVALID");
+  return event.data as Record<string, Json>;
+}
+
+async function qualifyLiveFailureFixtures(workspace: string): Promise<void> {
+  await assertContainedPath(workspace, join(workspace, ".coding-flow"));
+  const directory = join(workspace, ".coding-flow", `provider-fixtures-${randomUUID()}`);
+  await mkdir(directory, { mode: 0o700 });
+  const requireFailure = async (body: () => Promise<unknown>, code: string): Promise<void> => {
+    try { await body(); }
+    catch (error) {
+      const actual = error instanceof ProviderFailure ? error.code : "OUTCOME_UNKNOWN";
+      if (actual === code) return;
+    }
+    throw new Error("LIVE_FAILURE_FIXTURE_MISMATCH");
+  };
+  try {
+    if (decodeCodexAuth("Not logged in") !== "logged-out" || decodeClaudeAuth('{"loggedIn":false}') !== "logged-out"
+      || decodeClaudeAuth('{"loggedIn":true,"authMethod":"api_key","subscriptionType":"max"}') === "subscription") throw new Error("LIVE_FAILURE_FIXTURE_MISMATCH");
+    for (const auth of ["logged-out", "unknown"] as const) {
+      const adapter: Adapter = {
+        async status() { return { provider: "codex", executable: "fixture", version: CODEX_VERSION, qualified: true, auth }; },
+        invocation() { throw new Error("must not construct invocation"); }, async capture() { throw new Error("must not capture"); },
+        async decode() { throw new Error("must not decode"); },
+      };
+      await requireFailure(() => preflightProvider(adapter, new AbortController().signal), auth === "logged-out" ? "AUTH_REQUIRED" : "AUTH_UNVERIFIED");
+    }
+    const request: ProviderRequest = { prompt: "fixture", access: "read", model: "fixture-model", workspace, operationDirectory: directory, timeoutMs: 1_000 };
+    const now = new Date().toISOString();
+    const evidence = (stdout: Uint8Array) => ({ version: 1 as const, captureContext: { startedAt: now, returnedAt: now },
+      status: { exitCode: 0, signal: null, errorPresent: false }, stdout });
+    const stdoutPath = join(directory, "permission.json");
+    await writeDurable(stdoutPath, Buffer.from(`${JSON.stringify({ type: "system", subtype: "init", model: "fixture-model", session_id: "fixture-session" })}\n${JSON.stringify({ type: "result", subtype: "success", result: "ignored", permission_denials: ["Write"], session_id: "fixture-session" })}\n`));
+    await requireFailure(async () => decodeClaudeResult(request, evidence(await readBoundedFile(stdoutPath, 1024 * 1024))), "PERMISSION_DENIED");
+    for (const category of ["authentication expired", "quota exhausted"]) {
+      const claude = join(directory, `${category.replaceAll(" ", "-")}.json`);
+      await writeDurable(claude, Buffer.from(JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, errors: [category] })));
+      await requireFailure(async () => decodeClaudeResult(request, evidence(await readBoundedFile(claude, 1024 * 1024))), "OUTCOME_UNKNOWN");
+      const codex = `${claude}.jsonl`;
+      await writeDurable(codex, Buffer.from(`${JSON.stringify({ type: "turn.failed", error: { message: category } })}\n`));
+      await requireFailure(async () => decodeCodexResult(request, evidence(await readBoundedFile(codex, 1024 * 1024))), "OUTCOME_UNKNOWN");
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+export async function runLiveAcceptanceVerification(options: LiveAcceptanceOptions): Promise<LiveAcceptanceEvidenceV1> {
+  if (process.platform !== "linux" || process.version !== EXPECTED_NODE || options.target !== "linux-local") throw new Error("RUNTIME_UNQUALIFIED");
+  const workspace = resolve(options.workspace);
+  const repository = process.cwd();
+  const manifestPath = resolve(workspace, options.manifest);
+  const resultPath = resolve(workspace, options.result);
+  await assertContainedPath(workspace, manifestPath);
+  await assertContainedPath(workspace, dirname(resultPath));
+  if (!relative(workspace, resultPath).startsWith(`.coding-flow-qualification${sep}`)) throw new Error("LIVE_RESULT_PATH_INVALID");
+  const manifest = liveManifestSchema.parse(JSON.parse((await readBoundedFile(manifestPath, 64 * 1024)).toString("utf8")));
+  if (manifest.provider !== options.provider || manifest.target !== options.target || new Set(Object.values(manifest.runs)).size !== 3) throw new Error("LIVE_MANIFEST_MISMATCH");
+  const subject = await liveAcceptanceSubject(repository);
+  if (manifest.fixtureSha256 !== subject.fixtureSha256 || manifest.fixtureSetSha256 !== subject.fixtureSetSha256) throw new Error("LIVE_SUBJECT_MISMATCH");
+  const fixture = (await readBoundedFile(join(repository, LIVE_FIXTURE_SET[0]), 1024 * 1024)).toString("utf8");
+  const normalize = (source: string): string => source.replace(/from "[^"\n]*\/sdk\.js"/, 'from "coding-flow"');
+  const histories = new Map<string, readonly DurableEvent[]>();
+  const bundles = new Map<string, string>();
+  let limits: string | undefined;
+  let subscription: LiveAcceptanceEvidenceV1["subscription"] | undefined;
+  let happyBundle = "";
+  const verifyReferences = async (directory: string, value: Json): Promise<void> => {
+    const artifact = artifactRefSchema.safeParse(value);
+    if (artifact.success) { await verifyArtifact(directory, artifact.data); return; }
+    if (Array.isArray(value)) for (const item of value) await verifyReferences(directory, item);
+    else if (typeof value === "object" && value !== null) for (const item of Object.values(value)) await verifyReferences(directory, item);
+  };
+  for (const [role, runId] of Object.entries(manifest.runs)) {
+    const directory = join(workspace, ".coding-flow", "runs", runId);
+    const history = await readVerifiedEvents(workspace, runId);
+    histories.set(role, history);
+    const first = history[0];
+    if (!first || first.type !== "run.created") throw new Error("LIVE_HISTORY_MISSING");
+    const { supervisorPid: _pid, ...createdValue } = liveData(first);
+    const created = runManifestSchema.parse(createdValue);
+    if (created.fakeAgentResultsArtifact || created.runtime.provider !== options.provider || created.workspace !== workspace || !created.runtime.model) throw new Error("LIVE_RUNTIME_MISMATCH");
+    const age = Date.now() - Date.parse(first.timestamp);
+    if (!Number.isFinite(age) || age < 0 || age > MAX_EVIDENCE_AGE_MS) throw new Error("LIVE_EVIDENCE_STALE");
+    for (const event of history) await verifyReferences(directory, event.data);
+    await HumanCoordinator.validateHistory(directory, history);
+    const sourcePath = fileURLToPath(new URL(created.entry));
+    await assertContainedPath(workspace, sourcePath);
+    if (normalize((await readBoundedFile(sourcePath, 1024 * 1024)).toString("utf8")) !== normalize(fixture)) throw new Error("LIVE_FIXTURE_MISMATCH");
+    let rebuilt = bundles.get(sourcePath);
+    if (!rebuilt) {
+      const scratch = join(workspace, ".coding-flow", `acceptance-build-${randomUUID()}`);
+      try { rebuilt = (await buildFlow(new URL(created.entry), scratch, workspace)).artifact.sha256; }
+      finally { await rm(scratch, { recursive: true, force: true }); }
+      bundles.set(sourcePath, rebuilt);
+    }
+    if (created.bundleArtifact.sha256 !== rebuilt) throw new Error("LIVE_BUNDLE_MISMATCH");
+    const input = z.object({ message: z.string(), delayMs: z.number(), acceptance: z.literal(true) }).strict().parse(
+      JSON.parse((await verifyArtifact(directory, created.inputArtifact)).toString("utf8")));
+    const captured = history.filter(({ type }) => type === "workspace.captured");
+    if (captured.length !== 1) throw new Error("LIVE_LIMITS_MISMATCH");
+    const capturedLimits = liveData(captured[0]!).limits as { maxCommands: number; maxAgentCalls: number };
+    const currentLimits = canonicalJson({ capturedLimits, hostLimits: created.hostLimits } as unknown as Json);
+    if (limits !== undefined && limits !== currentLimits) throw new Error("LIVE_LIMITS_MISMATCH");
+    limits = currentLimits;
+    await ReplayFrontier.open({ runDirectory: directory, runId, journal: new Journal(directory, runId, history), history, limits: capturedLimits });
+    const terminal = history.at(-1)!;
+    if (role === "cancellation") {
+      if (terminal.type !== "run.cancelled" || history.filter(({ type }) => type === "cancel.requested").length !== 1) throw new Error("LIVE_CANCELLATION_MISSING");
+      continue;
+    }
+    if (terminal.type !== "run.succeeded") throw new Error("LIVE_SUCCESS_MISSING");
+    const output = JSON.parse((await verifyArtifact(directory, artifactRefSchema.parse(liveData(terminal).outputArtifact))).toString("utf8")) as Json;
+    if (canonicalJson(output) !== canonicalJson({ echoed: input.message })) throw new Error("LIVE_OUTPUT_MISMATCH");
+    const decisions = history.filter(({ type }) => type === "human.reply-decided");
+    const denied = history.filter(({ type }) => type === "approval.gate-denied");
+    const opened = history.filter(({ type }) => type === "approval.gate-opened");
+    const effects = history.filter(({ type }) => type === "approval.effect-authorized");
+    if (denied.length !== 1 || opened.length !== 1 || effects.length !== 1 || decisions.length !== 3
+      || liveData(denied[0]!).requestId === liveData(opened[0]!).requestId || liveData(effects[0]!).requestId !== liveData(opened[0]!).requestId
+      || denied[0]!.sequence >= opened[0]!.sequence || opened[0]!.sequence >= effects[0]!.sequence) throw new Error("LIVE_CONSENT_MISMATCH");
+    const commands = history.filter((event) => event.type === "operation.prepared" && liveData(event).kind === "command");
+    if (commands.length !== 1 || commands[0]!.sequence <= effects[0]!.sequence) throw new Error("LIVE_EFFECT_COUNT_MISMATCH");
+    const committed = history.filter((event) => event.type === "operation.committed" && liveData(event).preparedHash === commands[0]!.hash);
+    if (committed.length !== 1) throw new Error("LIVE_EFFECT_COUNT_MISMATCH");
+    const post = JSON.parse((await verifyArtifact(directory, artifactRefSchema.parse(liveData(committed[0]!).postWorkspaceArtifact))).toString("utf8")) as { files?: { path: string; sha256: string }[] };
+    if (post.files?.find(({ path }) => path === "acceptance-effect.txt")?.sha256 !== sha256(Buffer.from(`${input.message}\n`))) throw new Error("LIVE_EDIT_MISMATCH");
+    const observations = await readProviderObservations(directory, history);
+    const terminals = observations.filter(({ phase }) => phase === "terminal");
+    if (observations.length !== 2 || terminals.length !== 1) throw new Error("LIVE_PROVIDER_OBSERVATION_MISSING");
+    const provider = terminals[0]!;
+    if (provider.outcome !== "succeeded" || provider.auth !== "subscription" || !provider.sessionIdSha256
+      || provider.actualModel !== provider.requestedModel || provider.executableVersion !== (options.provider === "codex" ? CODEX_VERSION : CLAUDE_VERSION)) throw new Error("LIVE_SUBSCRIPTION_UNVERIFIED");
+    if (role === "happyPath") {
+      happyBundle = created.bundleArtifact.sha256;
+      subscription = { executableVersion: provider.executableVersion, auth: "subscription", requestedModel: provider.requestedModel,
+        actualModel: provider.actualModel, sessionIdSha256: provider.sessionIdSha256 };
+    } else {
+      const resumes = history.filter(({ type }) => type === "attempt.started");
+      if (resumes.length !== 1 || liveData(resumes[0]!).attempt !== 2 || resumes[0]!.sequence <= committed[0]!.sequence
+        || history.some((event) => event.sequence > resumes[0]!.sequence && ["dispatch.authorized", "operation.prepared", "provider.observed"].includes(event.type))) throw new Error("LIVE_RECOVERY_MISMATCH");
+    }
+  }
+  const happy = histories.get("happyPath")!;
+  const receipt = (text: string): DurableEvent => {
+    const [runId, sequence, hash, extra] = text.split(":");
+    const event = happy.find((event) => event.sequence === Number(sequence));
+    if (extra !== undefined || runId !== manifest.runs.happyPath || !event || event.hash !== hash) throw new Error("LIVE_RECONNECT_MISMATCH");
+    return event;
+  };
+  if (receipt(manifest.hostSteps.firstInvocationReceipt).sequence >= receipt(manifest.hostSteps.reconnectedInvocationReceipt).sequence) throw new Error("LIVE_RECONNECT_MISMATCH");
+  if (!subscription) throw new Error("LIVE_SUBSCRIPTION_UNVERIFIED");
+  await qualifyLiveFailureFixtures(workspace);
+  const unsigned: Omit<LiveAcceptanceEvidenceV1, "evidenceHash"> = {
+    version: 1, requestedTarget: "linux-local", provider: options.provider, runtime: { node: process.version, os: "linux" },
+    subject: { ...subject, bundleSha256: happyBundle }, subscription,
+    human: { rejectionEffects: 0, approvalEffects: 1 },
+    reconnection: { sameRun: "verified", journalContinuity: "verified", contextRestart: "operator-asserted" },
+    recovery: { resumedAfterSupervisorInterrupt: true, committedRedispatches: 0, limitsPreserved: true },
+    failures: { preflightAuth: "fixture-qualified", claudePermission: "fixture-qualified", codexPostAuthorization: "conservative-unknown", claudeAuthOrQuota: "conservative-unknown", cancellation: "live-qualified" },
+  };
+  const evidence: LiveAcceptanceEvidenceV1 = { ...unsigned, evidenceHash: sha256(Buffer.from(canonicalJson(unsigned as unknown as Json))) };
+  const temporary = join(dirname(resultPath), `.live-${randomUUID()}.tmp`);
+  const file = await open(temporary, "wx", 0o600);
+  try { await file.writeFile(`${canonicalJson(evidence as unknown as Json)}\n`); await file.sync(); }
+  finally { await file.close(); }
+  try { await link(temporary, resultPath); }
+  finally { await unlink(temporary); }
+  await syncDirectory(dirname(resultPath));
+  return evidence;
 }

@@ -139,3 +139,25 @@ export async function assertWorkspaceFresh(expected: WorkspaceManifest): Promise
   const actual = await captureWorkspace(expected.root, expected.policy);
   if (actual.sha256 !== expected.sha256) throw new Error("Workspace is stale");
 }
+
+export async function readWorkspaceFile(workspace: string, path: string): Promise<string> {
+  const root = await realpath(resolve(workspace));
+  const relativeCandidate = relativePath(path);
+  if (relativeCandidate === ".coding-flow" || relativeCandidate.startsWith(".coding-flow/")) {
+    throw new Error("Runtime state is not readable by flows");
+  }
+  const candidate = resolve(root, relativeCandidate);
+  let actual: string;
+  try {
+    actual = await realpath(candidate);
+  } catch {
+    throw new Error("Workspace file is unavailable");
+  }
+  if (actual !== candidate || relative(root, actual).startsWith(`..${sep}`)) throw new Error("Workspace path escapes workspace");
+  const bytes = await readBoundedFile(actual, 1024 * 1024);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("Workspace file must be UTF-8");
+  }
+}

@@ -10,8 +10,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json --noEmit false --outDir dist --rootDir .",
     "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint src tests --max-warnings=0",
     "test": "npm run build --silent && vitest --exclude 'dist/**'",
-    "test:foundation": "npm run build --silent && node dist/tests/qualification.test.js"
+    "test:foundation": "npm run build --silent && node dist/tests/qualification.test.js",
+    "test:host-acceptance": "npm run build --silent && node dist/tests/qualification.test.js --host-acceptance"
   },
   "dependencies": {
     "esbuild": "0.25.9",
@@ -21,7 +23,9 @@
   "devDependencies": {
     "@types/fs-ext": "2.0.3",
     "@types/node": "24.3.0",
+    "eslint": "^10.10.0",
     "typescript": "^5.9.2",
+    "typescript-eslint": "^8.70.0",
     "vitest": "4.0.17"
   },
   "engines": {

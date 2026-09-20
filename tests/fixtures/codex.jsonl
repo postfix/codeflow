@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000011"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"synthetic fixture"}}
+{"type":"turn.completed","usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":4}}

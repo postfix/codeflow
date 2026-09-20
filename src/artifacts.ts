@@ -1,12 +1,21 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, realpath, rename, unlink } from "node:fs/promises";
+import { lstat, open, readdir, realpath, rename, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { artifactRefSchema, canonicalJson, MAX_ARTIFACT_BYTES, MAX_JSON_BYTES, type ArtifactRef, type Json } from "./contracts.js";
 
 interface Writer {
   write(bytes: Uint8Array, offset: number, length: number): Promise<{ readonly bytesWritten: number }>;
 }
+
+interface StorageLimit {
+  readonly root: string;
+  readonly maxBytes: number;
+  usedBytes: number;
+}
+
+const storageLimit = new AsyncLocalStorage<StorageLimit>();
 
 export interface DurableWriteHooks {
   readonly rename?: typeof rename;
@@ -16,6 +25,56 @@ export interface DurableWriteHooks {
 function isOutside(root: string, candidate: string): boolean {
   const path = relative(root, candidate);
   return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
+}
+
+async function storedBytes(root: string): Promise<number> {
+  let total = 0;
+  const visit = async (directory: string): Promise<void> => {
+    for (const name of await readdir(directory)) {
+      const path = join(directory, name);
+      const info = await lstat(path);
+      if (info.isDirectory()) await visit(path);
+      else if (info.isFile()) total += info.size;
+      else throw new Error("Run storage contains an unsupported file");
+    }
+  };
+  await visit(root);
+  return total;
+}
+
+export async function withStorageLimit<T>(runDirectory: string, maxBytes: number, body: () => Promise<T>): Promise<T> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error("Invalid stored-byte limit");
+  const root = await realpath(resolve(runDirectory));
+  const usedBytes = await storedBytes(root);
+  if (usedBytes > maxBytes) throw new Error("LIMIT_EXCEEDED");
+  return storageLimit.run({ root, maxBytes, usedBytes }, body);
+}
+
+export async function refreshStoredBytes(runDirectory: string): Promise<void> {
+  const limit = storageLimit.getStore();
+  if (!limit || resolve(runDirectory) !== limit.root) return;
+  const usedBytes = await storedBytes(limit.root);
+  if (usedBytes > limit.maxBytes) throw new Error("LIMIT_EXCEEDED");
+  limit.usedBytes = usedBytes;
+}
+
+export function remainingStoredBytes(runDirectory: string): number {
+  const limit = storageLimit.getStore();
+  if (!limit || resolve(runDirectory) !== limit.root) return Number.MAX_SAFE_INTEGER;
+  return limit.maxBytes - limit.usedBytes;
+}
+
+export function reserveStoredBytes(path: string, bytes: number): () => void {
+  const limit = storageLimit.getStore();
+  if (!limit || isOutside(limit.root, resolve(path))) return () => undefined;
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || limit.usedBytes + bytes > limit.maxBytes) throw new Error("LIMIT_EXCEEDED");
+  limit.usedBytes += bytes;
+  let reserved = true;
+  return () => {
+    if (!reserved) return;
+    reserved = false;
+    limit.usedBytes -= bytes;
+  };
 }
 
 export async function assertContainedPath(root: string, candidate: string): Promise<void> {
@@ -72,10 +131,11 @@ export async function syncDirectory(path: string): Promise<void> {
 }
 
 export async function writeDurable(path: string, bytes: Uint8Array, hooks: DurableWriteHooks = {}): Promise<void> {
+  const releaseStorage = reserveStoredBytes(path, bytes.length);
   const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
-  const file = await open(temporary, "wx", 0o600);
   let moved = false;
   try {
+    const file = await open(temporary, "wx", 0o600);
     try {
       await writeAll(file, bytes);
       await file.sync();
@@ -86,7 +146,10 @@ export async function writeDurable(path: string, bytes: Uint8Array, hooks: Durab
     moved = true;
     await (hooks.syncDirectory ?? syncDirectory)(dirname(path));
   } catch (error) {
-    if (!moved) await unlink(temporary).catch(() => undefined);
+    if (!moved) {
+      releaseStorage();
+      await unlink(temporary).catch(() => undefined);
+    }
     throw error;
   }
 }
@@ -115,6 +178,49 @@ export async function publishJson(runDirectory: string, path: string, value: Jso
     sha256: createHash("sha256").update(bytes).digest("hex"),
     bytes: bytes.length,
     mediaType: "application/json",
+  };
+}
+
+export async function publishJsonOrReuse(runDirectory: string, path: string, value: Json): Promise<ArtifactRef> {
+  try { return await publishJson(runDirectory, path, value); }
+  catch (error) {
+    if (!(error instanceof Error && error.message === "Artifact already exists")) throw error;
+  }
+  const root = await realpath(resolve(runDirectory));
+  const candidate = resolve(path);
+  const bytes = Buffer.from(`${canonicalJson(value)}\n`, "utf8");
+  const artifact = {
+    path: relative(root, candidate), sha256: createHash("sha256").update(bytes).digest("hex"),
+    bytes: bytes.length, mediaType: "application/json",
+  } satisfies ArtifactRef;
+  await verifyArtifact(runDirectory, artifact);
+  return artifact;
+}
+
+export async function publishBytes(runDirectory: string, path: string, bytes: Uint8Array, mediaType: string): Promise<ArtifactRef> {
+  if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error("Artifact exceeds 64 MiB limit");
+  if (!mediaType || mediaType.length > 128) throw new Error("Invalid artifact media type");
+  const lexicalRoot = resolve(runDirectory);
+  const candidate = resolve(path);
+  if (isOutside(lexicalRoot, candidate)) throw new Error("Artifact escapes run directory");
+  const root = await realpath(lexicalRoot);
+  const parent = await realpath(dirname(candidate));
+  const canonicalCandidate = join(parent, basename(candidate));
+  if (isOutside(root, parent) || parent !== resolve(root, relative(lexicalRoot, dirname(candidate)))) {
+    throw new Error("Artifact escapes run directory");
+  }
+  await lstat(canonicalCandidate).then(
+    () => { throw new Error("Artifact already exists"); },
+    (error: unknown) => {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    },
+  );
+  await writeDurable(canonicalCandidate, bytes);
+  return {
+    path: relative(root, canonicalCandidate),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    bytes: bytes.length,
+    mediaType,
   };
 }
 

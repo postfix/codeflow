@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, test } from "vitest";
 import { formatPrompt, readInstruction } from "../src/prompts.js";
 import { prompt } from "../src/sdk.js";
-import { assertWorkspaceFresh, captureWorkspace } from "../src/workspace.js";
+import { assertWorkspaceFresh, captureWorkspace, readWorkspaceFile } from "../src/workspace.js";
 
 const temporary: string[] = [];
 
@@ -117,4 +117,22 @@ describe("workspace evidence", () => {
     expect(rendered).toBe(`A${value}B`);
     expect(elapsed).toBeLessThan(2_000);
   }, 15_000);
+});
+
+describe("author primitive composition finalization workspace", () => {
+  test("reads only contained regular strict UTF-8 files up to one MiB", async () => {
+    const root = await workspace();
+    await mkdir(join(root, ".coding-flow"));
+    await writeFile(join(root, "exact.txt"), "x".repeat(1024 * 1024));
+    await expect(readWorkspaceFile(root, "exact.txt")).resolves.toHaveLength(1024 * 1024);
+    await writeFile(join(root, "large.txt"), "x".repeat(1024 * 1024 + 1));
+    await expect(readWorkspaceFile(root, "large.txt")).rejects.toThrow("byte limit");
+    await writeFile(join(root, "invalid.txt"), Buffer.from([0xff]));
+    await expect(readWorkspaceFile(root, "invalid.txt")).rejects.toThrow("UTF-8");
+    await writeFile(join(root, ".coding-flow", "secret"), "secret");
+    await expect(readWorkspaceFile(root, ".coding-flow/secret")).rejects.toThrow("Runtime state");
+    await expect(readWorkspaceFile(root, "../outside")).rejects.toThrow("Invalid workspace path");
+    await symlink("exact.txt", join(root, "link.txt"));
+    await expect(readWorkspaceFile(root, "link.txt")).rejects.toThrow("escapes workspace");
+  });
 });
