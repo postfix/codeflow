@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
-import { publishJson, readBoundedFile, verifyArtifact, writeAll, writeDurable } from "../src/artifacts.js";
+import {
+  publishJson, readBoundedFile, refreshStoredBytes, verifyArtifact, withStorageLimit, writeAll, writeDurable,
+} from "../src/artifacts.js";
 import { canonicalJson, type Json } from "../src/contracts.js";
 import { Journal, readVerifiedEvents } from "../src/journal.js";
 import { supervise } from "../src/supervisor.js";
@@ -37,6 +39,21 @@ function createdData(root: string, runId: string): Json {
 }
 
 describe("durable storage", () => {
+  test("one cumulative limit covers artifacts journal data and raw output", async () => {
+    const root = await directory();
+    const runId = "00000000-0000-4000-8000-000000000049";
+    const artifact = Buffer.from("artifact");
+    const raw = Buffer.from("raw");
+
+    await expect(withStorageLimit(root, artifact.length + raw.length, async () => {
+      await writeDurable(join(root, "artifact.bin"), artifact);
+      await writeFile(join(root, "command.stdout.raw"), raw);
+      await refreshStoredBytes(root);
+      await new Journal(root, runId).append("run.created", createdData(root, runId));
+    })).rejects.toThrow("LIMIT_EXCEEDED");
+    await expect(readFile(join(root, "events.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("writeAll completes short writes", async () => {
     const chunks: Buffer[] = [];
     const writer = {

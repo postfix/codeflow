@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { assertPortableContract, type Json } from "./contracts.js";
+import { assertPortableContract, type ArtifactRef, type Json } from "./contracts.js";
 import { formatPrompt } from "./prompts.js";
 
 export { z } from "zod";
@@ -15,13 +15,77 @@ export interface Limits {
   readonly maxStoredBytes?: number;
 }
 
+export interface AgentOptions {
+  readonly name: string;
+  readonly prompt: string;
+  readonly access?: Access;
+  readonly instructions?: readonly string[];
+  readonly evidence?: readonly ArtifactRef[];
+  readonly timeoutMs?: number;
+}
+
+export interface Agent {
+  <S extends z.ZodType>(options: AgentOptions & { readonly output: S }): Promise<z.output<S>>;
+  (options: AgentOptions): Promise<string>;
+}
+
+export interface CommandOptions {
+  readonly cwd?: string;
+  readonly stdin?: string;
+  readonly timeoutMs?: number;
+}
+
+export interface CommandResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly truncated: boolean;
+  readonly stdoutArtifact: ArtifactRef;
+  readonly stderrArtifact: ArtifactRef;
+}
+
+export interface Presentation {
+  readonly title: string;
+  readonly markdown: string;
+  readonly artifacts?: readonly {
+    readonly label: string;
+    readonly mediaType: string;
+    readonly source: { readonly kind: "workspace"; readonly path: string }
+      | { readonly kind: "artifact"; readonly ref: ArtifactRef };
+  }[];
+}
+
+export interface Presented {
+  readonly id: string;
+  readonly hash: string;
+}
+
+export interface AskOptions<S extends z.ZodType> {
+  readonly question: string;
+  readonly presentation: Presentation | Presented;
+  readonly output: S;
+}
+
+export interface ApprovalOptions<P extends Json> {
+  readonly title: string;
+  readonly presentation: Presentation | Presented;
+  readonly action: P;
+  readonly watch?: readonly string[];
+}
+
+export interface Human {
+  present(content: Presentation): Promise<Presented>;
+  ask<S extends z.ZodType>(options: AskOptions<S>): Promise<z.output<S>>;
+  approve<P extends Json, T>(options: ApprovalOptions<P>, execute: (approvedAction: Readonly<P>) => Promise<T>): Promise<T>;
+}
+
 export interface FlowContext<I extends Json> {
   readonly input: Readonly<I>;
   readonly workspace: string;
   readonly signal: AbortSignal;
-  readonly agent: (...args: readonly unknown[]) => Promise<unknown>;
-  readonly human: Readonly<Record<string, never>>;
-  command(executable: string, args?: readonly string[]): Promise<unknown>;
+  readonly agent: Agent;
+  readonly human: Human;
+  command(executable: string, args?: readonly string[], options?: CommandOptions): Promise<CommandResult>;
   read(path: string): Promise<string>;
   phase<T>(name: string, body: () => Promise<T>): Promise<T>;
   skill<A extends Json, B extends Json>(child: Flow<A, B>, input: A): Promise<B>;
@@ -68,7 +132,21 @@ export function flow<const IS extends z.ZodType, const OS extends z.ZodType>(
   if (!definition.description) throw new Error("Flow description is required");
   assertPortableContract(definition.input);
   assertPortableContract(definition.output);
-  return Object.freeze({ ...definition, kind: "coding-flow/v2" as const }) as unknown as Flow<SchemaJson<IS>, SchemaJson<OS>>;
+  for (const [name, value] of Object.entries(definition.limits ?? {})) {
+    const allowsZero = name === "maxAgentCalls" || name === "maxCommands";
+    if (!Number.isSafeInteger(value) || value < (allowsZero ? 0 : 1)) throw new Error(`Invalid ${name}`);
+  }
+  const disposablePaths = definition.disposablePaths?.map((path) => {
+    if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").some((part) => !part || part === "." || part === "..")
+      || path === ".coding-flow" || path.startsWith(".coding-flow/")) throw new Error("Invalid disposable path");
+    return path;
+  });
+  return Object.freeze({
+    ...definition,
+    ...(definition.limits ? { limits: Object.freeze({ ...definition.limits }) } : {}),
+    ...(disposablePaths ? { disposablePaths: Object.freeze(disposablePaths) } : {}),
+    kind: "coding-flow/v2" as const,
+  }) as unknown as Flow<SchemaJson<IS>, SchemaJson<OS>>;
 }
 
 export function prompt(strings: TemplateStringsArray, ...values: readonly unknown[]): string {

@@ -21,6 +21,7 @@ let stdoutDescriptor: number | undefined;
 let stderrDescriptor: number | undefined;
 let stdoutPath: string | undefined;
 let stderrPath: string | undefined;
+let maxRawBytes = MAX_RAW_BYTES;
 
 function finish(): void {
   if (finished) return;
@@ -94,8 +95,13 @@ process.on("message", (message: unknown) => {
     || !("args" in message) || !Array.isArray(message.args) || !message.args.every((value) => typeof value === "string")
     || !("cwd" in message) || typeof message.cwd !== "string"
     || !("evidenceDirectory" in message) || typeof message.evidenceDirectory !== "string"
-    || !("timeoutMs" in message) || typeof message.timeoutMs !== "number") return;
+    || ("maxOutputBytes" in message && (!Number.isSafeInteger(message.maxOutputBytes) || (message.maxOutputBytes as number) < 0))
+    || !("timeoutMs" in message) || typeof message.timeoutMs !== "number"
+    || ("stdin" in message && typeof message.stdin !== "string")) return;
+  const stdin = "stdin" in message ? message.stdin as string : "";
+  if (Buffer.byteLength(stdin, "utf8") > 1024 * 1024) return;
   used = true;
+  maxRawBytes = Math.min("maxOutputBytes" in message ? message.maxOutputBytes as number : MAX_RAW_BYTES, MAX_RAW_BYTES);
   stdoutPath = join(message.evidenceDirectory, `${nonce}.stdout.raw`);
   stderrPath = join(message.evidenceDirectory, `${nonce}.stderr.raw`);
   const flags = constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW;
@@ -105,7 +111,12 @@ process.on("message", (message: unknown) => {
     cwd: message.cwd,
     detached: false,
     shell: false,
-    stdio: ["ignore", stdoutDescriptor, stderrDescriptor],
+    stdio: ["pipe", stdoutDescriptor, stderrDescriptor],
+  });
+  target.stdin?.on("error", (stdinError: NodeJS.ErrnoException) => {
+    if (stdinError.code === "EPIPE") return;
+    error = stdinError.message;
+    cleanup("STDIN_ERROR");
   });
   target.once("error", (spawnError) => {
     error = spawnError.message;
@@ -121,9 +132,10 @@ process.on("message", (message: unknown) => {
     if (stderrDescriptor !== undefined) closeSync(stderrDescriptor);
     finish();
   });
+  target.stdin?.end(stdin);
   outputPoll = setInterval(() => {
     if (stdoutDescriptor === undefined || stderrDescriptor === undefined) return;
-    if (fstatSync(stdoutDescriptor).size + fstatSync(stderrDescriptor).size > MAX_RAW_BYTES) {
+    if (fstatSync(stdoutDescriptor).size + fstatSync(stderrDescriptor).size > maxRawBytes) {
       truncated = true;
       error = "OUTPUT_LIMIT";
       cleanup("OUTPUT_LIMIT");

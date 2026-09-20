@@ -83,6 +83,7 @@ export interface ProcessRequest {
   readonly cwd: string;
   readonly timeoutMs: number;
   readonly evidenceDirectory: string;
+  readonly stdin?: string;
 }
 
 export interface Authorization {
@@ -191,7 +192,7 @@ export function readTail(descriptor: number, bytes: number, cutAtEnd: boolean): 
   return { text: decoded.slice(start), omitted: bytes > length || start > 0 || trailingIncomplete > 0 };
 }
 
-function finalizeRunnerReturn(returned: RunnerReturn): RunnerReturn {
+function finalizeRunnerReturn(returned: RunnerReturn, maxRawBytes: number): RunnerReturn {
   if (!returned.stdoutPath || !returned.stderrPath) return returned;
   const flags = constants.O_RDWR | constants.O_NOFOLLOW;
   const stdoutDescriptor = openSync(returned.stdoutPath, flags);
@@ -203,13 +204,13 @@ function finalizeRunnerReturn(returned: RunnerReturn): RunnerReturn {
     let stdoutBytes = originalStdoutBytes;
     let stderrBytes = originalStderrBytes;
     let overflowed = false;
-    if (stdoutBytes + stderrBytes > MAX_RAW_BYTES) {
+    if (stdoutBytes + stderrBytes > maxRawBytes) {
       overflowed = true;
-      if (stdoutBytes >= MAX_RAW_BYTES) {
-        stdoutBytes = MAX_RAW_BYTES;
+      if (stdoutBytes >= maxRawBytes) {
+        stdoutBytes = maxRawBytes;
         stderrBytes = 0;
       } else {
-        stderrBytes = MAX_RAW_BYTES - stdoutBytes;
+        stderrBytes = maxRawBytes - stdoutBytes;
       }
       ftruncateSync(stdoutDescriptor, stdoutBytes);
       ftruncateSync(stderrDescriptor, stderrBytes);
@@ -279,19 +280,19 @@ export class ProcessService {
           || !("groupId" in message) || typeof message.groupId !== "number"
           || !("nonce" in message) || message.nonce !== nonce
           || message.pid !== child.pid || message.groupId !== child.pid) {
-          void fail(runnerError("invalid registration handshake"));
+          fail(runnerError("invalid registration handshake")).catch(reject);
           return;
         }
         settled = true;
         cleanup();
         resolveReady({ pid: message.pid, groupId: message.groupId, nonce });
       };
-      const onError = (error: Error): void => { void fail(error); };
-      const onExit = (): void => { void fail(runnerError("runner exited before registration")); };
+      const onError = (error: Error): void => { fail(error).catch(reject); };
+      const onExit = (): void => { fail(runnerError("runner exited before registration")).catch(reject); };
       child.on("message", onMessage);
       child.once("error", onError);
       child.once("exit", onExit);
-      timeout = setTimeout(() => { void fail(runnerError("registration timed out")); }, this.#registrationTimeoutMs);
+      timeout = setTimeout(() => { fail(runnerError("registration timed out")).catch(reject); }, this.#registrationTimeoutMs);
     }).finally(() => this.#starting.delete(child));
     if (this.#disposed) {
       await stopUnregisteredChild(child);
@@ -311,8 +312,14 @@ export class ProcessService {
     return registered;
   }
 
-  async authorizeTarget(registered: RegisteredProcess, authorization: Authorization): Promise<RunnerReturn> {
+  async authorizeTarget(
+    registered: RegisteredProcess,
+    authorization: Authorization,
+    maxOutputBytes = MAX_RAW_BYTES,
+  ): Promise<RunnerReturn> {
     if (this.#disposed) throw new Error("Process service is disposed");
+    if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0) throw new Error("Invalid process request");
+    const maxRawBytes = Math.min(maxOutputBytes, MAX_RAW_BYTES);
     if (registered.authorized) throw new Error("Runner is already authorized");
     if (!this.#registered.has(registered)) throw new Error("Runner is not registered");
     if (authorization.attemptId !== registered.attemptId || authorization.nonce !== registered.nonce) {
@@ -341,7 +348,7 @@ export class ProcessService {
           return;
         }
         void this.assertGroupAbsent(registered.identity)
-          .then(() => resolveReturn(finalizeRunnerReturn(result)))
+          .then(() => resolveReturn(finalizeRunnerReturn(result, maxRawBytes)))
           .catch(reject);
       };
       registered.child.on("message", onMessage);
@@ -356,6 +363,8 @@ export class ProcessService {
         cwd: registered.request.cwd,
         timeoutMs: registered.request.timeoutMs,
         evidenceDirectory: registered.request.evidenceDirectory,
+        maxOutputBytes: maxRawBytes,
+        stdin: registered.request.stdin ?? "",
       });
     });
   }

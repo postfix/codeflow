@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"session-sanitized","model":"claude-sonnet-4-5"}
+{"type":"assistant","session_id":"session-sanitized","parent_tool_use_id":null,"message":{"model":"claude-sonnet-4-5","content":[{"type":"text","text":"synthetic fixture"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"sanitized","structured_output":{"ok":true},"session_id":"session-sanitized","permission_denials":[],"usage":{"input_tokens":12,"cache_read_input_tokens":3,"output_tokens":4},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":1},"claude-sonnet-4-5":{"inputTokens":12}}}
